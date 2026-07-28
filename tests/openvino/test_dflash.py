@@ -81,6 +81,53 @@ class DFlashExportTest(unittest.TestCase):
             annotated_model = ov.Core().read_model(annotated_dir / "openvino_model.xml")
             self._assert_hidden_state_rt_info_is_valid(annotated_model)
 
+    @staticmethod
+    def _tiny_gemma4_text_config(config_class, **extra_config):
+        config = {
+            "vocab_size": 64,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "num_global_key_value_heads": 2,
+            "head_dim": 16,
+            "global_head_dim": 16,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+        }
+        config.update(extra_config)
+        return config_class(**config)
+
+    def _assert_gemma4_text_export_is_annotated(self, model):
+        with TemporaryDirectory() as tmpdirname:
+            output_dir = Path(tmpdirname)
+            export_from_model(
+                model=model,
+                output=output_dir,
+                task="text-generation-with-past",
+                preprocessors=None,
+                stateful=True,
+            )
+            annotated_model = ov.Core().read_model(output_dir / "openvino_model.xml")
+            self._assert_hidden_state_rt_info_is_valid(annotated_model)
+
+    @unittest.skipUnless(is_transformers_version(">=", "5.5.0"), "Gemma 4 requires Transformers >= 5.5.0")
+    def test_export_hidden_state_locators_for_gemma4_text(self):
+        import importlib
+
+        transformers = importlib.import_module("transformers")
+        config = self._tiny_gemma4_text_config(transformers.Gemma4TextConfig, hidden_size_per_layer_input=0)
+        self._assert_gemma4_text_export_is_annotated(transformers.Gemma4ForCausalLM(config))
+
+    @unittest.skipUnless(is_transformers_version(">=", "5.10.0"), "Gemma 4 Unified requires Transformers >= 5.10.0")
+    def test_export_hidden_state_locators_for_gemma4_unified_text(self):
+        import importlib
+
+        transformers = importlib.import_module("transformers")
+        config = self._tiny_gemma4_text_config(transformers.Gemma4UnifiedTextConfig)
+        self._assert_gemma4_text_export_is_annotated(transformers.Gemma4UnifiedForCausalLM(config))
+
     def test_hidden_state_locators_survive_weight_compression(self):
         with TemporaryDirectory() as tmpdirname:
             tmpdirname = Path(tmpdirname)

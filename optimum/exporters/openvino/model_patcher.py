@@ -2742,7 +2742,10 @@ class Gemma2ModelPatcher(OVDecoderModelPatcher):
                 and cache_position_index != -1
                 and (cache_position_index > len(args) and "cache_position" not in kwargs)
             ):
-                past_seen_tokens = legacy_pkv[0][0].shape[-2]
+                # Gemma 4 mixes sliding-window and full-attention cache
+                # lengths. Deriving the position from the first cache can
+                # truncate masks needed by full-attention layers during trace.
+                past_seen_tokens = max(key.shape[-2] for key, _ in legacy_pkv)
                 input_ids = args[input_ids_index] if "input_ids" not in kwargs else kwargs["input_ids"]
                 cache_position = torch.arange(
                     past_seen_tokens, past_seen_tokens + input_ids.shape[1], device=input_ids.device

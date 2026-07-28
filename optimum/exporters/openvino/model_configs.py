@@ -1464,6 +1464,9 @@ class Gemma4TextOpenVINOConfig(Gemma3TextOpenVINOConfig):
     DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, Gemma4DummyPastKeyValuesGenerator)
     DUMMY_PKV_GENERATOR_CLASS = Gemma4DummyPastKeyValuesGenerator
     MIN_TRANSFORMERS_VERSION = "5.5"
+    # Do not inherit Gemma's legacy 5.0 upper bound. Gemma 4 text models use
+    # the Transformers 5.5-5.10 implementation and its KV-cache layout.
+    MAX_TRANSFORMERS_VERSION = "5.10.99"
 
     def add_past_key_values(self, inputs_or_outputs: dict[str, dict[int, str]], direction: str):
         if direction not in ["inputs", "outputs"]:
@@ -5235,7 +5238,10 @@ class Gemma4OpenVINOConfig(Gemma3OpenVINOConfig):
                 "per_layer_inputs": {0: "batch_size", 1: "sequence_length", 2: "num_hidden_layers"},
             }
             if getattr(self._orig_config.get_text_config(), "use_bidirectional_attention", None) == "vision":
-                inputs_update["token_type_ids"] = {0: "batch_size", 1: "sequence_length"}
+                inputs_update["token_type_ids"] = {
+                    0: "batch_size",
+                    1: "past_sequence_length + sequence_length",
+                }
             return get_vlm_text_generation_config(
                 model_type,
                 self._orig_config.text_config,
@@ -5537,7 +5543,10 @@ class Gemma4UnifiedOpenVINOConfig(Gemma3OpenVINOConfig):
         if behavior == VLMConfigBehavior.LANGUAGE:
             inputs_update = {}
             if getattr(self._orig_config.get_text_config(), "use_bidirectional_attention", None) == "vision":
-                inputs_update["token_type_ids"] = {0: "batch_size", 1: "sequence_length"}
+                inputs_update["token_type_ids"] = {
+                    0: "batch_size",
+                    1: "past_sequence_length + sequence_length",
+                }
             return get_vlm_text_generation_config(
                 "gemma4_unified_text",
                 self._orig_config.text_config,

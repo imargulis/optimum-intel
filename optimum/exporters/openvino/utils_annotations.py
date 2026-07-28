@@ -34,6 +34,12 @@ def _discover_decoder_stack(source_model) -> Sequence[str]:
     """Return the one ordered decoder-layer module stack."""
     recorders = getattr(source_model, "can_record_outputs", {})
     recorder = recorders.get("hidden_states") if isinstance(recorders, dict) else None
+    # Gemma 4 causal-LM wrappers expose recording support on their nested text
+    # model rather than on the wrapper itself.
+    if recorder is None:
+        base_model = getattr(source_model, "model", None)
+        recorders = getattr(base_model, "can_record_outputs", {})
+        recorder = recorders.get("hidden_states") if isinstance(recorders, dict) else None
     # Transformers accepts either a decoder-layer class directly or an OutputRecorder wrapper.
     decoder_layer_class = getattr(recorder, "target_class", recorder)
     if not isinstance(decoder_layer_class, type):

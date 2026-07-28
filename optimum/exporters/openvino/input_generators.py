@@ -408,12 +408,10 @@ class Gemma4DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
         self.global_head_dim = getattr(normalized_config.config, "global_head_dim", self.head_dim)
         self.layer_types = normalized_config.config.layer_types
         self.num_kv_shared_layers = normalized_config.config.num_kv_shared_layers
-        self.sliding_window = normalized_config.config.sliding_window
         # Full-attention layers use fewer KV heads than sliding-attention layers (e.g. 2 vs 8 for 26B-A4B)
         self.num_global_key_value_heads = (
             getattr(normalized_config.config, "num_global_key_value_heads", None) or self.num_key_value_heads
         )
-        self.model_type = normalized_config.config.model_type
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
         # some layers do not produce their own KV-cache, they use the shared KV-cache
@@ -427,7 +425,7 @@ class Gemma4DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
                 shape = (
                     self.batch_size,
                     self.num_key_value_heads,
-                    self.sequence_length if self.model_type == "gemma3n_text" else self.sliding_window,
+                    self.sequence_length,
                     self.head_dim,
                 )
             else:

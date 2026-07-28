@@ -16,8 +16,10 @@ import copy
 import functools
 import gc
 import inspect
+import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -84,6 +86,47 @@ from .utils_annotations import add_hidden_states_rt_info
 
 
 logger = logging.getLogger(__name__)
+
+
+_ADJACENT_JINJA_STRING_LITERALS = re.compile(
+    r'raise_exception\(\s*(?P<literals>(?:"(?:\\.|[^"\\])*"\s*)+)\)',
+    flags=re.DOTALL,
+)
+
+
+def _normalize_chat_template_for_openvino(template: str) -> str:
+    """
+    Collapse adjacent Jinja string literals in ``raise_exception`` calls.
+
+    Hugging Face Jinja accepts this Python-like syntax, while OpenVINO
+    Tokenizers rejects it during template parsing. Gemma 4's tool-call template
+    uses this construct in an otherwise unexecuted validation branch.
+    """
+
+    def collapse_literals(match: re.Match) -> str:
+        literals = re.findall(r'"((?:\\.|[^"\\])*)"', match.group("literals"))
+        message = "".join(json.loads(f'"{literal}"') for literal in literals)
+        return f"raise_exception({json.dumps(message)})"
+
+    return _ADJACENT_JINJA_STRING_LITERALS.sub(collapse_literals, template)
+
+
+def _normalize_tokenizer_chat_template_for_openvino(tokenizer) -> bool:
+    template = getattr(tokenizer, "chat_template", None)
+    if isinstance(template, str):
+        normalized = _normalize_chat_template_for_openvino(template)
+        if normalized != template:
+            tokenizer.chat_template = normalized
+            return True
+    elif isinstance(template, dict):
+        normalized = {
+            name: _normalize_chat_template_for_openvino(value) if isinstance(value, str) else value
+            for name, value in template.items()
+        }
+        if normalized != template:
+            tokenizer.chat_template = normalized
+            return True
+    return False
 
 if is_torch_available():
     import torch.nn as nn
@@ -152,6 +195,8 @@ def _save_model(
         "qwen3_5_moe",
         "qwen3_5_text",
         "qwen3_5_moe_text",
+        "gemma4_text",
+        "gemma4_unified_text",
     }:
         add_hidden_states_rt_info(source_model, model, config)
 
@@ -871,6 +916,9 @@ def export_tokenizer(
 
     if output.exists():
         tokenizer = maybe_convert_tokenizer_to_fast(tokenizer, output)
+
+    if _normalize_tokenizer_chat_template_for_openvino(tokenizer):
+        logger.info("Normalized adjacent string literals in the tokenizer chat template for OpenVINO.")
 
     if (
         task is not None
