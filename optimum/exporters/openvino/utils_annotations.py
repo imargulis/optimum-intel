@@ -34,12 +34,6 @@ def _discover_decoder_stack(source_model) -> Sequence[str]:
     """Return the one ordered decoder-layer module stack."""
     recorders = getattr(source_model, "can_record_outputs", {})
     recorder = recorders.get("hidden_states") if isinstance(recorders, dict) else None
-    # Gemma 4 causal-LM wrappers expose recording support on their nested text
-    # model rather than on the wrapper itself.
-    if recorder is None:
-        base_model = getattr(source_model, "model", None)
-        recorders = getattr(base_model, "can_record_outputs", {})
-        recorder = recorders.get("hidden_states") if isinstance(recorders, dict) else None
     # Transformers accepts either a decoder-layer class directly or an OutputRecorder wrapper.
     decoder_layer_class = getattr(recorder, "target_class", recorder)
     if not isinstance(decoder_layer_class, type):
@@ -67,6 +61,31 @@ def _discover_decoder_stack(source_model) -> Sequence[str]:
             "Expected one contiguous decoder-layer stack, " f"found {len(candidates)}: {sorted(candidates)}."
         )
     return next(iter(candidates.values()))
+
+
+def _select_hidden_state_recording_model(source_model):
+    """Return the module that declares the decoder hidden-state recorder."""
+
+    def has_hidden_state_recorder(model):
+        recorders = getattr(model, "can_record_outputs", {})
+        return isinstance(recorders, dict) and recorders.get("hidden_states") is not None
+
+    if has_hidden_state_recorder(source_model):
+        return "", source_model
+
+    candidates = []
+    for module_name, module in source_model.named_modules():
+        if module is source_model or not has_hidden_state_recorder(module):
+            continue
+        config = getattr(module, "config", None)
+        if config is None:
+            continue
+        if hasattr(config, "num_hidden_layers") and hasattr(config, "hidden_size"):
+            candidates.append((module_name, module))
+
+    if len(candidates) != 1:
+        raise ValueError(f"Expected one hidden-state recording module, found {len(candidates)}.")
+    return candidates[0]
 
 
 def _infer_scope_prefix(ops: Iterable[Any], decoder_stack: str, num_layers: int) -> str:
@@ -184,8 +203,11 @@ def discover_hidden_state_rt_info(source_model, ov_model) -> Dict[str, Any]:
     the language-model head.
     """
 
-    decoder_modules = _discover_decoder_stack(source_model)
-    hidden_size = int(source_model.config.hidden_size)
+    recording_module_name, recording_model = _select_hidden_state_recording_model(source_model)
+    decoder_modules = _discover_decoder_stack(recording_model)
+    if recording_module_name:
+        decoder_modules = [f"{recording_module_name}.{decoder_module}" for decoder_module in decoder_modules]
+    hidden_size = int(recording_model.config.hidden_size)
     ops = ov_model.get_ordered_ops()
     scope_prefix = _infer_scope_prefix(ops, decoder_modules[0].rpartition(".")[0], len(decoder_modules))
     lm_heads = [name for name, _ in source_model.named_modules() if name.rsplit(".", 1)[-1] == "lm_head"]

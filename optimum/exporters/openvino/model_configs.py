@@ -131,6 +131,7 @@ from optimum.exporters.openvino.model_patcher import (
     Gemma4LMModelPatcher,
     Gemma4UnifiedImageEmbeddingsModelPatcher,
     Gemma4UnifiedLMModelPatcher,
+    Gemma4UnifiedTextOnlyLMModelPatcher,
     GptJModelPatcher,
     GptNeoModelPatcher,
     GptOssModelPatcher,
@@ -1505,6 +1506,7 @@ class Gemma4UnifiedTextOpenVINOConfig(Gemma4TextOpenVINOConfig):
     # The gemma4_unified text model shares gemma4's KV-cache layout (mixed sliding/full
     # attention, optional global KV heads / head dim), so add_past_key_values is inherited.
     # It has no per-layer embeddings (PLE), so no extra inputs are required.
+    _MODEL_PATCHER = Gemma4UnifiedTextOnlyLMModelPatcher
     MIN_TRANSFORMERS_VERSION = "5.10"
     MAX_TRANSFORMERS_VERSION = "5.10.99"
 

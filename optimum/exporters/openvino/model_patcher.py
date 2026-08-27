@@ -9797,6 +9797,65 @@ def gemma4_unified_lm_forward(
     return tuple([value if not isinstance(value, list) else tuple(value) for value in outputs_dict.values()])
 
 
+def gemma4_unified_text_only_lm_forward(
+    self,
+    input_ids: Optional[torch.LongTensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[Cache] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    token_type_ids: Optional[torch.LongTensor] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    logits_to_keep: Union[int, torch.Tensor] = 0,
+    **lm_kwargs,
+):
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    use_cache = False
+
+    if past_key_values is not None:
+        use_cache = True
+        past_key_values = preprocess_past_key_values(past_key_values)
+
+    outputs = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        cache_position=cache_position,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=True,
+        **lm_kwargs,
+    )
+
+    hidden_states = outputs.last_hidden_state
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    tmp_logits = self.lm_head(hidden_states[:, slice_indices, :])
+    if (final_logit_softcapping := getattr(self.config, "final_logit_softcapping", None)) is not None:
+        tmp_logits = tmp_logits / final_logit_softcapping
+        tmp_logits = torch.tanh(tmp_logits)
+        tmp_logits = tmp_logits * final_logit_softcapping
+
+    outputs_dict = {
+        "logits": tmp_logits,
+    }
+
+    if use_cache:
+        key_values = outputs.past_key_values
+        present_key_values = postprocess_past_key_values(key_values)
+        outputs_dict["past_key_values"] = present_key_values
+    return tuple([value if not isinstance(value, list) else tuple(value) for value in outputs_dict.values()])
+
+
 class Gemma4UnifiedLMModelPatcher(Gemma3LMModelPatcher):
     def __init__(self, config, model, model_kwargs):
         super().__init__(config, model, model_kwargs)
@@ -9826,6 +9885,35 @@ class Gemma4UnifiedLMModelPatcher(Gemma3LMModelPatcher):
 
         setattr(self._model, self.orig_forward_name, self.model_orig_forward)
         setattr(self._model.model, "forward", self.model_orig_language_model_forward)
+
+
+class Gemma4UnifiedTextOnlyLMModelPatcher(Gemma3LMModelPatcher):
+    def __init__(self, config, model, model_kwargs):
+        super().__init__(config, model, model_kwargs)
+
+        self.patched_forward = gemma4_unified_text_only_lm_forward
+        self.model_orig_forward = self.orig_forward
+        self.orig_forward = gemma4_unified_text_only_lm_forward
+
+    def __enter__(self):
+        super().__enter__()
+
+        setattr(
+            self._model, self.orig_forward_name, types.MethodType(gemma4_unified_text_only_lm_forward, self._model)
+        )
+        for decoder_layer in self._model.model.layers:
+            decoder_layer.self_attn.orig_forward = decoder_layer.self_attn.forward
+            decoder_layer.self_attn.forward = types.MethodType(
+                gemma4_unified_text_attention_forward, decoder_layer.self_attn
+            )
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+
+        for decoder_layer in self._model.model.layers:
+            decoder_layer.self_attn.forward = decoder_layer.self_attn.orig_forward
+
+        setattr(self._model, self.orig_forward_name, self.model_orig_forward)
 
 
 # The gemma4_unified vision tower is encoder-free: get_image_features projects raw merged
