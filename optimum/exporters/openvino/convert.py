@@ -1103,6 +1103,7 @@ def _add_dflash_selector_mode_to_rt_info(model: Model, hf_config: "PretrainedCon
     model.set_rt_info("True", ["dflash_selector_mode"])
     model.set_rt_info("2", ["dflash_selector", "dflash_version"])
     model.set_rt_info("unary_inclusive", ["dflash_selector", "score_semantics"])
+    model.set_rt_info("topk_lattice_v1", ["dflash_selector", "interface"])
     model.set_rt_info(str(hf_config.hidden_size), ["dflash_selector", "hidden_size"])
     model.set_rt_info(str(hf_config.vocab_size), ["dflash_selector", "vocab_size"])
     model.set_rt_info(str(dflash_config["selector_top_k"]), ["dflash_selector", "top_k"])

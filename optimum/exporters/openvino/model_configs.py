@@ -625,15 +625,17 @@ class DFlash2SelectorOpenVINOConfig(OpenVINOConfig):
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         return {
-            "candidate_ids": {0: "batch_size", 1: "draft_sequence_length"},
-            "unary_logits": {0: "batch_size", 1: "draft_sequence_length"},
+            "draft_logits": {0: "batch_size", 1: "draft_sequence_length"},
             "draft_hidden_states": {0: "batch_size", 1: "draft_sequence_length"},
             "anchor_token_ids": {0: "batch_size"},
         }
 
     @property
     def outputs(self) -> Dict[str, Dict[int, str]]:
-        return {"edge_scores": {0: "batch_size", 1: "draft_sequence_length"}}
+        return {
+            "edge_scores": {0: "batch_size", 1: "draft_sequence_length"},
+            "candidate_ids": {0: "batch_size", 1: "draft_sequence_length"},
+        }
 
 
 @register_in_tasks_manager(

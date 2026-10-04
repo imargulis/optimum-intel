@@ -1052,6 +1052,10 @@ class OVCLIExportTestCase(unittest.TestCase):
             )
             selector_model = core.read_model(selector_path)
             self.assertTrue(selector_model.has_rt_info(["dflash_selector", "dflash_version"]))
+            self.assertEqual(
+                selector_model.get_rt_info()["dflash_selector"]["interface"].value,
+                "topk_lattice_v1",
+            )
             self.assertFalse(selector_model.has_rt_info(["runtime_options", "ACTIVATIONS_SCALE_FACTOR"]))
             self.assertFalse(selector_model.has_rt_info(["runtime_options", "KV_CACHE_PRECISION"]))
 
