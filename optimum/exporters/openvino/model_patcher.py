@@ -9491,30 +9491,39 @@ class Qwen3DFlash2ForCausalLM(Qwen3DFlash2DraftModel, GenerationMixin):
 
 
 class Qwen3DFlash2SelectorForExport(nn.Module):
-    """Export-only wrapper that keeps selector weights in a separate OpenVINO graph."""
+    """Export-only dynamic Top-K and candidate-lattice graph for DFlash-2."""
 
     def __init__(self, candidate_selector: DFlash2CandidateSelector, config: "Qwen3Config"):
         super().__init__()
         self.candidate_selector = candidate_selector
         self.config = config
+        dflash_config = parse_and_validate_dflash_config(config, expected_version=2).values
+        self.selector_top_k = dflash_config["selector_top_k"]
+        self.output_multiplier = dflash_config.get("output_multiplier", 1.0)
+        self.final_logit_softcapping = dflash_config.get("final_logit_softcapping", 0.0)
         # 16-bit export keeps module weights in checkpoint precision but casts bare parameters to float32.
         self.predecessor_lookup = nn.Embedding.from_pretrained(candidate_selector.predecessor_codebook, freeze=True)
         self.successor_lookup = nn.Embedding.from_pretrained(candidate_selector.successor_codebook, freeze=True)
 
     def forward(
         self,
-        candidate_ids: torch.LongTensor,
-        unary_logits: torch.Tensor,
+        draft_logits: torch.Tensor,
         draft_hidden_states: torch.Tensor,
         anchor_token_ids: torch.LongTensor,
-    ) -> torch.Tensor:
+    ) -> ModelOutput:
+        unary_logits, candidate_ids = torch.topk(draft_logits, self.selector_top_k, dim=-1)
+        candidate_ids = candidate_ids.to(torch.int64)
+        unary_logits = unary_logits * self.output_multiplier
+        if self.final_logit_softcapping > 0.0:
+            unary_logits = torch.tanh(unary_logits / self.final_logit_softcapping) * self.final_logit_softcapping
         predecessor_ids = self.candidate_selector.predecessor_ids(candidate_ids, anchor_token_ids)
-        return self.candidate_selector.score(
+        edge_scores = self.candidate_selector.score(
             self.predecessor_lookup(predecessor_ids),
             self.successor_lookup(candidate_ids),
             unary_logits,
             draft_hidden_states,
         )
+        return ModelOutput(edge_scores=edge_scores, candidate_ids=candidate_ids)
 
 
 # adopted from https://github.com/deepseek-ai/DeepSpec/blob/main/deepspec/modeling/dspark/qwen3/modeling.py#L201

@@ -486,11 +486,13 @@ class DFlash2ExportTest(unittest.TestCase):
             draft_ir = core.read_model(output_dir / "openvino_model.xml")
             selector_ir = core.read_model(output_dir / "openvino_selector_model.xml")
             self.assertEqual({item.any_name for item in draft_ir.outputs}, {"last_hidden_state"})
-            self.assertEqual({item.any_name for item in selector_ir.outputs}, {"edge_scores"})
+            self.assertEqual({item.any_name for item in selector_ir.outputs}, {"edge_scores", "candidate_ids"})
             self.assertEqual(
                 {item.any_name for item in selector_ir.inputs},
-                {"candidate_ids", "unary_logits", "draft_hidden_states", "anchor_token_ids"},
+                {"draft_logits", "draft_hidden_states", "anchor_token_ids"},
             )
+            self.assertEqual(selector_ir.input("draft_logits").element_type, ov.Type.f32)
+            self.assertEqual(selector_ir.output("candidate_ids").element_type, ov.Type.i64)
             self.assertEqual(draft_ir.get_rt_info()["dflash"]["version"].value, "2")
             for name in ("input_embedding_scale", "output_multiplier", "final_logit_softcapping"):
                 self.assertEqual(
@@ -498,8 +500,10 @@ class DFlash2ExportTest(unittest.TestCase):
                     config.dflash_config[name],
                 )
             self.assertEqual(selector_ir.get_rt_info()["dflash_selector"]["score_semantics"].value, "unary_inclusive")
+            self.assertEqual(selector_ir.get_rt_info()["dflash_selector"]["interface"].value, "topk_lattice_v1")
             self.assertFalse(draft_ir.has_rt_info(["hidden_states_decoder_layers"]))
             self.assertFalse(selector_ir.has_rt_info(["hidden_states_decoder_layers"]))
+            self.assertTrue(any(op.get_type_name() == "TopK" for op in selector_ir.get_ops()))
 
             codebook_shape = (config.vocab_size, config.dflash_config["selector_rank"])
             self.assertEqual(self._constant_count_with_shape(draft_ir, codebook_shape), 0)
@@ -530,21 +534,26 @@ class DFlash2ExportTest(unittest.TestCase):
                         )
                     )
 
-                    candidate_ids = torch.randint(
-                        config.vocab_size,
-                        (1, num_draft_tokens, config.dflash_config["selector_top_k"]),
-                    )
-                    unary_logits = torch.randn(1, num_draft_tokens, config.dflash_config["selector_top_k"])
                     selector_inputs = {
-                        "candidate_ids": candidate_ids,
-                        "unary_logits": unary_logits,
+                        "draft_logits": torch_logits,
                         "draft_hidden_states": torch_hidden,
                         "anchor_token_ids": torch.tensor([1]),
                     }
                     with torch.no_grad():
-                        torch_edges = parts["selector_model"][0](**selector_inputs)
-                    ov_edges = compiled_selector({name: value.numpy() for name, value in selector_inputs.items()})[0]
-                    torch.testing.assert_close(torch.from_numpy(np.array(ov_edges)), torch_edges)
+                        torch_selector_outputs = parts["selector_model"][0](**selector_inputs)
+                    ov_selector_outputs = compiled_selector({name: value.numpy() for name, value in selector_inputs.items()})
+                    ov_edges = ov_selector_outputs[compiled_selector.output("edge_scores")]
+                    ov_candidate_ids = ov_selector_outputs[compiled_selector.output("candidate_ids")]
+                    torch.testing.assert_close(
+                        torch.from_numpy(np.array(ov_edges)),
+                        torch_selector_outputs.edge_scores,
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            torch.from_numpy(np.array(ov_candidate_ids)),
+                            torch_selector_outputs.candidate_ids,
+                        )
+                    )
 
             if "GPU" in core.available_devices:
                 gpu_draft = core.compile_model(draft_ir, "GPU")
@@ -557,18 +566,21 @@ class DFlash2ExportTest(unittest.TestCase):
                     self.assertEqual(gpu_hidden.shape, (1, num_draft_tokens, config.hidden_size))
                     self.assertTrue(np.isfinite(gpu_hidden).all())
 
-                    top_k = config.dflash_config["selector_top_k"]
                     selector_inputs = {
-                        "candidate_ids": np.random.randint(
+                        "draft_logits": np.random.randn(
+                            1,
+                            num_draft_tokens,
                             config.vocab_size,
-                            size=(1, num_draft_tokens, top_k),
-                            dtype=np.int64,
-                        ),
-                        "unary_logits": np.random.randn(1, num_draft_tokens, top_k).astype(np.float32),
+                        ).astype(np.float32),
                         "draft_hidden_states": gpu_hidden,
                         "anchor_token_ids": np.array([1], dtype=np.int64),
                     }
-                    gpu_edges = np.array(gpu_selector(selector_inputs)[0])
+                    gpu_outputs = gpu_selector(selector_inputs)
+                    gpu_edges = np.array(gpu_outputs[gpu_selector.output("edge_scores")])
+                    gpu_candidate_ids = np.array(gpu_outputs[gpu_selector.output("candidate_ids")])
+                    top_k = config.dflash_config["selector_top_k"]
+                    self.assertTrue(np.issubdtype(gpu_candidate_ids.dtype, np.integer))
+                    self.assertEqual(gpu_candidate_ids.shape, (1, num_draft_tokens, top_k))
                     self.assertEqual(gpu_edges.shape, (1, num_draft_tokens, top_k, top_k))
                     self.assertTrue(np.isfinite(gpu_edges).all())
 
@@ -662,7 +674,7 @@ class DFlash2ExportTest(unittest.TestCase):
             )
             self.assertEqual(
                 [item.any_name for item in selector_ir.inputs],
-                ["candidate_ids", "unary_logits", "draft_hidden_states", "anchor_token_ids"],
+                ["draft_logits", "draft_hidden_states", "anchor_token_ids"],
             )
 
     def test_bf16_two_ir_export_keeps_fp32_runtime_contract(self):

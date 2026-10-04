@@ -259,7 +259,7 @@ class Eagle3DummyGenerator(DummyInputGenerator):
 class DFlash2SelectorDummyGenerator(DummyInputGenerator):
     """Dummy inputs for the DFlash-2 candidate-selector graph."""
 
-    SUPPORTED_INPUT_NAMES = ("candidate_ids", "unary_logits", "draft_hidden_states", "anchor_token_ids")
+    SUPPORTED_INPUT_NAMES = ("draft_logits", "draft_hidden_states", "anchor_token_ids")
 
     def __init__(
         self,
@@ -271,21 +271,10 @@ class DFlash2SelectorDummyGenerator(DummyInputGenerator):
     ):
         self.batch_size = batch_size
         self.hidden_size = normalized_config.hidden_size
-        config = normalized_config.config
-        dflash_config = parse_and_validate_dflash_config(config, expected_version=2).values
-
         self.num_draft_tokens = sequence_length
-        self.selector_top_k = dflash_config["selector_top_k"]
         self.vocab_size = normalized_config.vocab_size
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
-        if input_name == "candidate_ids":
-            return self.random_int_tensor(
-                (self.batch_size, self.num_draft_tokens, self.selector_top_k),
-                max_value=self.vocab_size,
-                framework=framework,
-                dtype=int_dtype,
-            )
         if input_name == "anchor_token_ids":
             return self.random_int_tensor(
                 (self.batch_size,),
@@ -293,8 +282,8 @@ class DFlash2SelectorDummyGenerator(DummyInputGenerator):
                 framework=framework,
                 dtype=int_dtype,
             )
-        if input_name == "unary_logits":
-            shape = (self.batch_size, self.num_draft_tokens, self.selector_top_k)
+        if input_name == "draft_logits":
+            shape = (self.batch_size, self.num_draft_tokens, self.vocab_size)
         elif input_name == "draft_hidden_states":
             shape = (self.batch_size, self.num_draft_tokens, self.hidden_size)
         else:
