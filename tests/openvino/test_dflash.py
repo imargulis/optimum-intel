@@ -632,7 +632,6 @@ class DFlash2ExportTest(unittest.TestCase):
                 stateful_dir,
                 task="text-generation-with-past",
                 stateful=True,
-                trust_remote_code=True,
             )
             core = ov.Core()
             draft_ir = core.read_model(stateful_dir / "openvino_model.xml")
@@ -653,7 +652,6 @@ class DFlash2ExportTest(unittest.TestCase):
                 explicit_cache_dir,
                 task="text-generation-with-past",
                 stateful=False,
-                trust_remote_code=True,
             )
             explicit_draft = ov.Core().read_model(explicit_cache_dir / "openvino_model.xml")
             self.assertTrue(any(item.any_name.startswith("past_key_values") for item in explicit_draft.inputs))

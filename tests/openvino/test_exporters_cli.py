@@ -1054,9 +1054,6 @@ class OVCLIExportTestCase(unittest.TestCase):
                     "openvino",
                     "--model",
                     model_path,
-                    "--task",
-                    "text-generation-with-past",
-                    "--trust-remote-code",
                     tmpdir,
                 ],
                 check=True,
@@ -1100,7 +1097,6 @@ class OVCLIExportTestCase(unittest.TestCase):
                     "text-generation-with-past",
                     "--weight-format",
                     weight_format,
-                    "--trust-remote-code",
                 ]
                 if weight_format == "int4":
                     command.extend(["--group-size", "-1"])
@@ -1129,7 +1125,6 @@ class OVCLIExportTestCase(unittest.TestCase):
                     "text-generation-with-past",
                     "--weight-format",
                     "fp16",
-                    "--trust-remote-code",
                     tmpdir,
                 ],
                 check=True,

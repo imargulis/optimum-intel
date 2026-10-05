@@ -27,9 +27,13 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import is_torch_available
 
-from openvino import Core, Type, save_model
+from openvino import Core, Model, Type, save_model
 from optimum.exporters.openvino.base import OpenVINOConfig
-from optimum.exporters.openvino.dflash_utils import DFLASH_ARCHITECTURES, parse_and_validate_dflash_config
+from optimum.exporters.openvino.dflash_utils import (
+    DFLASH_ARCHITECTURES,
+    is_dflash_draft_model,
+    parse_and_validate_dflash_config,
+)
 from optimum.exporters.tasks import TasksManager
 from optimum.intel.utils.import_utils import (
     DIFFUSERS_IMPORT_ERROR,
@@ -110,7 +114,7 @@ def infer_task(
                     token=token,
                     library_name=library_name,
                 )
-            except KeyError as e:
+            except (KeyError, RuntimeError) as e:
                 try:
                     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
                     with_past_arch_list = [
@@ -118,6 +122,7 @@ def infer_task(
                         "Zamba2ForCausalLM",
                         "LlamaForCausalLMEagle3",
                         "Eagle3LlamaForCausalLM",
+                        *_NATIVE_DRAFT_MODEL_CLASSES,
                     ]
                     if any(arch in config.architectures for arch in with_past_arch_list):
                         # VLM Eagle3 models (targeting VLM architectures like Qwen3-VL)
@@ -129,6 +134,8 @@ def infer_task(
                             task = "image-text-to-text"
                         else:
                             task = "text-generation-with-past"
+                    else:
+                        raise e
                 except Exception:
                     raise KeyError(
                         f"The task could not be automatically inferred. Please provide the argument --task with the relevant task from {', '.join(TasksManager.get_all_tasks())}. Detailed error: {e}"
@@ -168,6 +175,8 @@ def infer_task(
                     raise e
             else:
                 raise
+        if original_task == "auto" and (config.architectures or [None])[0] in _NATIVE_DRAFT_MODEL_CLASSES:
+            task = "text-generation-with-past"
         if hasattr(config, "export_model_type"):
             model_type = config.export_model_type
         else:
@@ -224,10 +233,23 @@ def _ensure_qwen3_omni_rope_scaling(config):
 _CUSTOM_DRAFT_MODEL_MAP = {
     "LlamaForCausalLMEagle3": ("LlamaEagle3Model", "LlamaEagle3ForCausalLM"),
     "Eagle3LlamaForCausalLM": ("LlamaEagle3Model", "LlamaEagle3ForCausalLM"),
-    "DFlashDraftModel": ("Qwen3DFlashDraftModel", "Qwen3DFlashForCausalLM"),
-    "Qwen3DSparkModel": ("Qwen3DFlashDraftModel", "Qwen3DSparkForCausalLM"),
-    "DFlash2DraftModel": ("Qwen3DFlash2DraftModel", "Qwen3DFlash2ForCausalLM"),
 }
+
+# Maps config.architectures[0] to the model_patcher export class of DFlash draft models. They are
+# loaded directly, so unlike `_CUSTOM_DRAFT_MODEL_MAP` they need no `auto_map` indirection (and no
+# `trust_remote_code`).
+_NATIVE_DRAFT_MODEL_CLASSES = {
+    "DFlashDraftModel": "Qwen3DFlashForCausalLM",
+    "Qwen3DSparkModel": "Qwen3DSparkForCausalLM",
+    "DFlash2DraftModel": "Qwen3DFlash2ForCausalLM",
+}
+
+
+def load_native_draft_model(architecture: str, model_name_or_path: str, **kwargs):
+    from optimum.exporters.openvino import model_patcher
+
+    model_class = getattr(model_patcher, _NATIVE_DRAFT_MODEL_CLASSES[architecture])
+    return model_class.from_pretrained(model_name_or_path, **kwargs)
 
 
 def update_config_for_custom_draft_model(config, auto_model, auto_model_for_causal_lm):
@@ -387,7 +409,6 @@ def main_export(
     do_quant_patching = False
     patch_16bit = False
     loading_kwargs = model_loading_kwargs or {}
-    draft_model_class_name = None
     if variant is not None:
         loading_kwargs["variant"] = variant
     dtype = loading_kwargs.get("torch_dtype", None)
@@ -416,9 +437,6 @@ def main_export(
             draft_classes = _CUSTOM_DRAFT_MODEL_MAP.get(archs[0])
             if draft_classes is not None:
                 loading_kwargs["config"] = update_config_for_custom_draft_model(config, *draft_classes)
-                # config.auto_map is honored only with trust_remote_code=True, which also makes transformers
-                # check every import of model_patcher.py, so the draft class is instantiated directly instead
-                draft_model_class_name = draft_classes[1] if task.startswith("text-generation") else draft_classes[0]
 
         # mxfp4 quantized model will be dequantized to bf16
         if quant_method == "mxfp4" and is_transformers_version(">=", "4.55"):
@@ -642,6 +660,21 @@ def main_export(
             from optimum.intel.openvino.modeling_funasr import _FunASRForSpeechSeq2Seq
 
             model = _FunASRForSpeechSeq2Seq.from_pretrained(model_name_or_path, cache_dir=cache_dir, token=token)
+        elif (
+            library_name == "transformers"
+            and (getattr(config, "architectures", None) or [None])[0] in _NATIVE_DRAFT_MODEL_CLASSES
+        ):
+            model = load_native_draft_model(
+                config.architectures[0],
+                model_name_or_path,
+                subfolder=subfolder,
+                revision=revision,
+                cache_dir=cache_dir,
+                token=token,
+                local_files_only=local_files_only,
+                force_download=force_download,
+                **loading_kwargs,
+            )
         elif library_name == "qwen3_tts":
             # Without an explicit request the checkpoint's own precision is kept, so the IRs
             # come out at the precision the model was published in rather than upcast. A
@@ -666,37 +699,21 @@ def main_export(
                 if has_remote_code and trust_remote_code and task == "image-text-to-text":
                     task_model_loading = "text-generation"
 
-            if draft_model_class_name is not None:
-                from optimum.exporters.openvino import model_patcher
-
-                with torch.device(device or "cpu"):
-                    model = getattr(model_patcher, draft_model_class_name).from_pretrained(
-                        model_name_or_path,
-                        subfolder=subfolder,
-                        revision=revision,
-                        cache_dir=cache_dir,
-                        token=token,
-                        local_files_only=local_files_only,
-                        force_download=force_download,
-                        **loading_kwargs,
-                    )
-                TasksManager.standardize_model_attributes(model, library_name=library_name)
-            else:
-                model = TasksManager.get_model_from_task(
-                    task_model_loading,
-                    model_name_or_path,
-                    subfolder=subfolder,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    token=token,
-                    local_files_only=local_files_only,
-                    force_download=force_download,
-                    trust_remote_code=trust_remote_code,
-                    framework=framework,
-                    device=device,
-                    library_name=library_name,
-                    **loading_kwargs,
-                )
+            model = TasksManager.get_model_from_task(
+                task_model_loading,
+                model_name_or_path,
+                subfolder=subfolder,
+                revision=revision,
+                cache_dir=cache_dir,
+                token=token,
+                local_files_only=local_files_only,
+                force_download=force_download,
+                trust_remote_code=trust_remote_code,
+                framework=framework,
+                device=device,
+                library_name=library_name,
+                **loading_kwargs,
+            )
 
         if getattr(model, "dtype", None) in [torch.float16, torch.bfloat16]:
             patch_16bit = True
@@ -827,6 +844,7 @@ def _main_quantize(
             `model_kwargs={"output_attentions": True}` is passed).
 
     """
+    from optimum.intel.openvino.configuration import OVWeightQuantizationConfig
     from optimum.intel.openvino.utils import _HEAD_TO_AUTOMODELS
 
     # Step 0. Infer task and library name if needed
@@ -907,6 +925,16 @@ def _main_quantize(
     )
 
     # Step 3. Apply quantization and save the quantized model
+    if (
+        isinstance(quantization_config, OVWeightQuantizationConfig)
+        and quantization_config.bits == 4
+        and quantization_config.all_layers is None
+        and isinstance(getattr(model, "model", None), Model)
+        and is_dflash_draft_model(model.model)
+    ):
+        # DFlash drafts have no embeddings or lm_head, so NNCF's "last MatMul stays int8" rule would hit a decoder layer.
+        quantization_config = quantization_config.clone()
+        quantization_config.all_layers = True
     model._apply_quantization(
         quantization_config,
         compile_only=False,
