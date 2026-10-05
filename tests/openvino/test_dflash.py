@@ -45,6 +45,7 @@ from optimum.exporters.openvino.model_patcher import (
     Qwen3DFlash2ForCausalLM,
     Qwen3DFlashForCausalLM,
     Qwen3DSparkForCausalLM,
+    _dflash_block_hidden_states,
     _dflash_block_tap_masks,
 )
 from optimum.intel.openvino.utils import TemporaryDirectory
@@ -873,6 +874,71 @@ class DFlashPerRowBackendTest(unittest.TestCase):
                 expected_window = _SLIDING_WINDOW if config.layer_types[layer_idx] == "sliding_attention" else 0
                 self.assertEqual(self._source_constant(op.input_value(_PA_SLIDING_WINDOW)).item(), expected_window)
 
+    def _compile_paged_draft(self, draft_path, config, num_blocks):
+        """The draft converted to PagedAttention and compiled on CPU, with zeroed caches of num_blocks blocks."""
+        core = ov.Core()
+        paged_model = core.read_model(draft_path)
+        self._assert_paged_attention_conversion(paged_model, config)
+        properties = {"INFERENCE_PRECISION_HINT": "f32", "KV_CACHE_PRECISION": "f32"}
+        compiled = core.compile_model(paged_model, "CPU", properties)
+        request = compiled.create_infer_request()
+        cache_names = set()
+        for port in compiled.inputs:
+            name = port.get_any_name()
+            if name.startswith(("key_cache.", "value_cache.")):
+                shape = [num_blocks] + [dim.get_length() for dim in list(port.get_partial_shape())[1:]]
+                cache = ov.Tensor(port.get_element_type(), shape)
+                cache.data[...] = 0
+                request.set_tensor(name, cache)
+                cache_names.add(name)
+        return request, cache_names
+
+    @staticmethod
+    def _paged_feed(sequence_inputs, committed_lengths, block_tables):
+        """Token-major inputs of one PagedAttention call over the new rows of several sequences.
+
+        past_lens excludes the previous block of each sequence, so the call overwrites it.
+        """
+
+        def rows(name):
+            return torch.cat([inputs[name][0] for inputs in sequence_inputs])
+
+        num_rows = [inputs["token_type_ids"].shape[1] for inputs in sequence_inputs]
+        return {
+            "inputs_embeds": rows("inputs_embeds").numpy(),
+            "hidden_states": rows("hidden_states")[:, None].numpy(),
+            "position_ids": rows("position_ids").numpy(),
+            "token_type_ids": rows("token_type_ids")[:, None].numpy(),
+            "past_lens": np.array(committed_lengths, dtype=np.int32),
+            "subsequence_begins": np.cumsum([0, *num_rows], dtype=np.int32),
+            "block_indices": np.concatenate(block_tables).astype(np.int32),
+            "block_indices_begins": np.cumsum([0, *map(len, block_tables)], dtype=np.int32),
+            "max_context_len": np.array(max(map(sum, zip(committed_lengths, num_rows))), dtype=np.int32),
+        }
+
+    def test_block_rows_are_selected_in_every_sequence(self):
+        # rows of two sequences, [2 context ; 3 block] and [1 context ; 4 block]
+        token_type_ids = torch.tensor([[0, 0, 1, 1, 1, 0, 1, 1, 1, 1]])
+        last_hidden_state = torch.arange(10.0).reshape(1, 10, 1)
+        inputs_embeds = torch.zeros(1, 10, 1)
+        layouts = {
+            "sequence axis": (token_type_ids, last_hidden_state),
+            "token axis": (token_type_ids.reshape(10, 1), last_hidden_state.reshape(10, 1, 1)),
+        }
+        for layout, (row_types, row_states) in layouts.items():
+            for drop_seed, logits_to_keep, expected_rows in (
+                (False, None, [2, 3, 4, 6, 7, 8, 9]),
+                (True, None, [3, 4, 7, 8, 9]),
+                (True, 2, [3, 4, 8, 9]),
+                (True, 0, [2, 3, 4, 6, 7, 8, 9]),
+            ):
+                with self.subTest(layout=layout, drop_seed=drop_seed, logits_to_keep=logits_to_keep):
+                    selected = _dflash_block_hidden_states(
+                        row_states, row_types, inputs_embeds, drop_seed=drop_seed, logits_to_keep=logits_to_keep
+                    )
+                    self.assertEqual(selected.shape, (1, len(expected_rows), 1))
+                    self.assertEqual(selected.flatten().tolist(), expected_rows)
+
     @parameterized.expand(VARIANTS)
     def test_per_row_draft_reads_each_input_only_in_its_rows(self, variant):
         model = self._model(variant)
@@ -916,41 +982,57 @@ class DFlashPerRowBackendTest(unittest.TestCase):
                     torch.testing.assert_close(output, reference, rtol=1e-4, atol=1e-5, msg=f"step {step}")
 
             with self.subTest(backend="PagedAttention"):
-                paged_model = core.read_model(draft_path)
-                self._assert_paged_attention_conversion(paged_model, config)
-                compiled = core.compile_model(paged_model, "CPU", {**f32, "KV_CACHE_PRECISION": "f32"})
-                request = compiled.create_infer_request()
                 max_length = sum(context for context, _ in _DRAFT_STEPS) + max(block for _, block in _DRAFT_STEPS)
-                num_blocks = math.ceil(max_length / _CPU_KV_BLOCK_SIZE)
-                cache_names = set()
-                for port in compiled.inputs:
-                    name = port.get_any_name()
-                    if name.startswith(("key_cache.", "value_cache.")):
-                        shape = [num_blocks] + [dim.get_length() for dim in list(port.get_partial_shape())[1:]]
-                        cache = ov.Tensor(port.get_element_type(), shape)
-                        cache.data[...] = 0
-                        request.set_tensor(name, cache)
-                        cache_names.add(name)
-
+                request, cache_names = self._compile_paged_draft(
+                    draft_path, config, math.ceil(max_length / _CPU_KV_BLOCK_SIZE)
+                )
                 committed_length = 0
                 for step, ((context_length, block_length), inputs, reference) in enumerate(
                     zip(_DRAFT_STEPS, steps, references)
                 ):
-                    # token-major rows; past_lens excludes the previous block, so this step overwrites it
-                    num_rows = context_length + block_length
-                    used_blocks = math.ceil((committed_length + num_rows) / _CPU_KV_BLOCK_SIZE)
-                    feed = {
-                        "inputs_embeds": inputs["inputs_embeds"].reshape(num_rows, -1).numpy(),
-                        "hidden_states": inputs["hidden_states"].reshape(num_rows, 1, -1).numpy(),
-                        "position_ids": inputs["position_ids"].reshape(num_rows).numpy(),
-                        "token_type_ids": inputs["token_type_ids"].reshape(num_rows, 1).numpy(),
-                        "past_lens": np.array([committed_length], dtype=np.int32),
-                        "subsequence_begins": np.array([0, num_rows], dtype=np.int32),
-                        "block_indices": np.arange(used_blocks, dtype=np.int32),
-                        "block_indices_begins": np.array([0, used_blocks], dtype=np.int32),
-                        "max_context_len": np.array(committed_length + num_rows, dtype=np.int32),
-                    }
-                    self.assertEqual({port.get_any_name() for port in compiled.inputs}, set(feed) | cache_names)
+                    used_blocks = math.ceil((committed_length + context_length + block_length) / _CPU_KV_BLOCK_SIZE)
+                    feed = self._paged_feed([inputs], [committed_length], [np.arange(used_blocks)])
+                    self.assertEqual({port.get_any_name() for port in request.model_inputs}, set(feed) | cache_names)
                     output = torch.from_numpy(np.array(request.infer(feed)["last_hidden_state"]))
                     torch.testing.assert_close(output, reference, rtol=1e-4, atol=1e-5, msg=f"step {step}")
                     committed_length += context_length
+
+    @parameterized.expand(VARIANTS)
+    def test_paged_backend_drafts_several_sequences_in_one_call(self, variant):
+        model = self._model(variant)
+        config = model.config
+        # (context delta, block) rows of two sequences per call; only the context rows in front of each
+        # block keep the blocks of different sequences apart
+        sequence_steps = (((34, 4), (3, 4), (1, 4)), ((5, 4), (1, 4), (2, 4)))
+        torch.manual_seed(3)
+        sequences = []
+        for steps in sequence_steps:
+            committed_length, inputs = 0, []
+            for context_length, block_length in steps:
+                inputs.append(_per_row_inputs(config, context_length, block_length, committed_length))
+                committed_length += context_length
+            sequences.append(inputs)
+        references = [self._reference_outputs(model, inputs) for inputs in sequences]
+        blocks_per_sequence = max(
+            math.ceil((sum(context for context, _ in steps) + max(block for _, block in steps)) / _CPU_KV_BLOCK_SIZE)
+            for steps in sequence_steps
+        )
+        with TemporaryDirectory() as tmpdirname:
+            draft_path = self._export_stateful_draft(model, Path(tmpdirname))
+            request, _ = self._compile_paged_draft(draft_path, config, blocks_per_sequence * len(sequences))
+            committed_lengths = [0] * len(sequences)
+            for step in range(len(sequence_steps[0])):
+                step_inputs = [inputs[step] for inputs in sequences]
+                block_tables = [
+                    sequence * blocks_per_sequence
+                    + np.arange(math.ceil((committed + inputs["token_type_ids"].shape[1]) / _CPU_KV_BLOCK_SIZE))
+                    for sequence, (committed, inputs) in enumerate(zip(committed_lengths, step_inputs))
+                ]
+                feed = self._paged_feed(step_inputs, committed_lengths, block_tables)
+                output = torch.from_numpy(np.array(request.infer(feed)["last_hidden_state"]))
+                # the candidate rows of all sequences, concatenated in row order
+                reference = torch.cat([outputs[step] for outputs in references], dim=1)
+                torch.testing.assert_close(output, reference, rtol=1e-4, atol=1e-5, msg=f"step {step}")
+                committed_lengths = [
+                    committed + steps[step][0] for committed, steps in zip(committed_lengths, sequence_steps)
+                ]

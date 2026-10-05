@@ -9024,19 +9024,38 @@ def _dflash_attention_masks(
 
 
 def _dflash_block_hidden_states(
-    last_hidden_state: torch.Tensor, token_type_ids: Optional[torch.Tensor], inputs_embeds: torch.Tensor
+    last_hidden_state: torch.Tensor,
+    token_type_ids: Optional[torch.Tensor],
+    inputs_embeds: torch.Tensor,
+    drop_seed: bool,
+    logits_to_keep: Optional[int] = None,
 ) -> torch.Tensor:
-    """Hidden states of the trailing block rows as [batch, block, hidden].
+    """Hidden states of the block rows as [batch, rows, hidden].
 
-    Without token_type_ids, inputs_embeds holds only the block rows. With token_type_ids, the flattened
-    rows of a single sequence are sliced, which holds whether tokens lie along the sequence axis (stateful
-    SDPA) or along the batch axis (after SDPAToPagedAttention).
+    drop_seed drops the first row of every block; logits_to_keep instead keeps the last logits_to_keep rows of
+    every block, or all of them for 0. Without token_type_ids, inputs_embeds holds only the block rows. With
+    token_type_ids, rows are selected by type over the flattened rows, which holds whether tokens lie along the
+    sequence axis (stateful SDPA) or along the batch axis (after SDPAToPagedAttention). The selected rows of all
+    sequences are concatenated in row order into batch 1, which requires every block to follow at least one
+    context row of its own sequence.
     """
     if token_type_ids is None:
-        return last_hidden_state[:, -inputs_embeds.shape[1] :, :]
+        block_hidden_states = last_hidden_state[:, -inputs_embeds.shape[1] :, :]
+        if logits_to_keep is not None:
+            return block_hidden_states[:, -logits_to_keep:, :]
+        return block_hidden_states[:, 1:, :] if drop_seed else block_hidden_states
+    token_types = token_type_ids.reshape(-1)
+    keep = token_types == 1
+    if logits_to_keep:
+        # a row is not among the last logits_to_keep of its block when that many block rows follow it
+        followed = keep
+        for shift in range(1, logits_to_keep + 1):
+            followed = followed & (F.pad(token_types, (0, shift))[shift:] == 1)
+        keep = keep & ~followed
+    elif logits_to_keep is None and drop_seed:
+        keep = keep & (F.pad(token_types, (1, 0))[:-1] == 1)
     rows = last_hidden_state.reshape(-1, last_hidden_state.shape[-1])
-    block_length = (token_type_ids == 1).sum()
-    return rows[rows.shape[0] - block_length :][None]
+    return rows.index_select(0, torch.nonzero(keep).reshape(-1))[None]
 
 
 def _dflash_block_tap_masks(token_type_ids: torch.Tensor, kernel_size: int) -> List[torch.Tensor]:
@@ -9356,11 +9375,9 @@ class Qwen3DFlashForCausalLM(Qwen3DFlashDraftModel, GenerationMixin):
         )
         # Keep the block rows and drop the seed so emitted hidden states align 1:1 with the draft candidate
         # tokens that the grafted lm_head will score.
-        block_hidden_states = _dflash_block_hidden_states(outputs.last_hidden_state, token_type_ids, inputs_embeds)
-        if logits_to_keep is None:
-            last_hidden_state = block_hidden_states[:, 1:, :]
-        else:
-            last_hidden_state = block_hidden_states[:, -logits_to_keep:, :]
+        last_hidden_state = _dflash_block_hidden_states(
+            outputs.last_hidden_state, token_type_ids, inputs_embeds, drop_seed=True, logits_to_keep=logits_to_keep
+        )
         return BaseModelOutputWithPast(
             last_hidden_state=last_hidden_state,
             past_key_values=outputs.past_key_values,
@@ -9525,11 +9542,9 @@ class Qwen3DFlash2ForCausalLM(Qwen3DFlash2DraftModel, GenerationMixin):
             token_type_ids=token_type_ids,
             **kwargs,
         )
-        block_hidden_states = _dflash_block_hidden_states(outputs.last_hidden_state, token_type_ids, inputs_embeds)
-        if logits_to_keep is None:
-            last_hidden_state = block_hidden_states[:, 1:, :]
-        else:
-            last_hidden_state = block_hidden_states[:, -logits_to_keep:, :]
+        last_hidden_state = _dflash_block_hidden_states(
+            outputs.last_hidden_state, token_type_ids, inputs_embeds, drop_seed=True, logits_to_keep=logits_to_keep
+        )
         return BaseModelOutputWithPast(
             last_hidden_state=last_hidden_state,
             past_key_values=outputs.past_key_values,
@@ -9601,11 +9616,9 @@ class Qwen3DSparkForCausalLM(Qwen3DFlashDraftModel, GenerationMixin):
             token_type_ids=token_type_ids,
             **kwargs,
         )
-        block_hidden_states = _dflash_block_hidden_states(outputs.last_hidden_state, token_type_ids, inputs_embeds)
-        if logits_to_keep is None:
-            last_hidden_state = block_hidden_states
-        else:
-            last_hidden_state = block_hidden_states[:, -logits_to_keep:, :]
+        last_hidden_state = _dflash_block_hidden_states(
+            outputs.last_hidden_state, token_type_ids, inputs_embeds, drop_seed=False, logits_to_keep=logits_to_keep
+        )
         return BaseModelOutputWithPast(
             last_hidden_state=last_hidden_state,
             past_key_values=outputs.past_key_values,
