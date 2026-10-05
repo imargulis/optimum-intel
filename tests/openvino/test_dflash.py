@@ -907,6 +907,7 @@ class DFlashPerRowBackendTest(unittest.TestCase):
         f32 = {"INFERENCE_PRECISION_HINT": "f32"}
         with TemporaryDirectory() as tmpdirname:
             draft_path = self._export_stateful_draft(model, Path(tmpdirname))
+            self.assertEqual(core.read_model(draft_path).get_rt_info()["dflash"]["input_layout"].value, "per_row")
 
             with self.subTest(backend="stateful SDPA"):
                 request = core.compile_model(core.read_model(draft_path), "CPU", f32).create_infer_request()

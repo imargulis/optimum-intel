@@ -33,6 +33,7 @@ from openvino.tools.ovc import convert_model
 from optimum.exporters.openvino.dflash_utils import (
     DFLASH2_GPU_MIN_ACTIVATIONS_SCALE_FACTOR,
     DFLASH_ARCHITECTURES,
+    DFLASH_INPUT_LAYOUT,
     parse_and_validate_dflash_config,
 )
 from optimum.exporters.openvino.utils import (
@@ -1055,6 +1056,7 @@ def _add_dflash_mode_to_rt_info(model: Model, hf_config: "PretrainedConfig", can
         model.set_rt_info(str(dflash_config["mask_token_id"]), ["dflash", "mask_token_id"])
         model.set_rt_info(",".join(map(str, dflash_config["target_layer_ids"])), ["dflash", "target_layer_ids"])
         model.set_rt_info(str(candidate_position_offset), ["dflash", "candidate_position_offset"])
+        model.set_rt_info(DFLASH_INPUT_LAYOUT, ["dflash", "input_layout"])
         if dflash.version == 2:
             model.set_rt_info("2", ["dflash", "version"])
             model.set_rt_info(
@@ -1076,6 +1078,7 @@ def _add_dflash_mode_to_rt_info(model: Model, hf_config: "PretrainedConfig", can
         if "target_layer_ids" in dflash_config:
             model.set_rt_info(",".join(map(str, dflash_config["target_layer_ids"])), ["dflash", "target_layer_ids"])
         model.set_rt_info(str(candidate_position_offset), ["dflash", "candidate_position_offset"])
+        model.set_rt_info(DFLASH_INPUT_LAYOUT, ["dflash", "input_layout"])
     except Exception:
         pass
 

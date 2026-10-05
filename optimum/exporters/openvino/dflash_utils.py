@@ -32,6 +32,9 @@ DFLASH_ARCHITECTURES = set(DFLASH_ARCHITECTURE_VERSIONS)
 # stored as DFlash-specific IR metadata and applied by GenAI as an explicit compile property, since
 # the GPU plugin intentionally does not consume generic activation-scale RT info for LLM graphs.
 DFLASH2_GPU_MIN_ACTIVATIONS_SCALE_FACTOR = 32.0
+# Every per-token draft input spans the new rows [context delta ; block], told apart by token_type_ids.
+# Drafts exported without this marker take the context rows in hidden_states and the block in inputs_embeds.
+DFLASH_INPUT_LAYOUT = "per_row"
 DFLASH_COMMON_CONFIG_FIELDS = (
     "mask_token_id",
     "target_layer_ids",
