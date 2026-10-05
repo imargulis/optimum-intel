@@ -14,8 +14,10 @@
 
 
 import json
+import math
 import os
 import unittest
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
@@ -24,8 +26,10 @@ import nncf
 import numpy as np
 import openvino as ov
 import torch
+from openvino._offline_transformations import paged_attention_transformation
 from parameterized import parameterized
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+from transformers.cache_utils import DynamicCache
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from utils_tests import MODEL_NAMES, get_dflash2_model_path
@@ -40,9 +44,29 @@ from optimum.exporters.openvino.model_patcher import (
     GroupedDynamicCausalConv,
     Qwen3DFlash2ForCausalLM,
     Qwen3DFlashForCausalLM,
+    Qwen3DSparkForCausalLM,
+    _dflash_block_tap_masks,
 )
 from optimum.intel.openvino.utils import TemporaryDirectory
 from optimum.intel.utils.import_utils import is_transformers_version
+
+
+def _per_row_inputs(config, context_length, block_length, committed_length):
+    """Per-row draft inputs over the new rows [context delta ; block] of one sequence."""
+    num_rows = context_length + block_length
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    num_target_layers = len(dflash_config.get("target_layer_ids") or config.target_layer_ids)
+    inputs_embeds = torch.randn(1, num_rows, config.hidden_size)
+    inputs_embeds[:, :context_length] = 0
+    hidden_states = torch.randn(1, num_rows, config.hidden_size * num_target_layers)
+    hidden_states[:, context_length:] = 0
+    return {
+        "inputs_embeds": inputs_embeds,
+        "hidden_states": hidden_states,
+        "position_ids": torch.arange(committed_length, committed_length + num_rows).reshape(1, -1),
+        "attention_mask": torch.ones(1, committed_length + num_rows, dtype=torch.int64),
+        "token_type_ids": torch.tensor([[0] * context_length + [1] * block_length]),
+    }
 
 
 class DFlashExportTest(unittest.TestCase):
@@ -193,17 +217,7 @@ class DFlash2ExportTest(unittest.TestCase):
 
     @staticmethod
     def _backbone_inputs(config, num_draft_tokens, context_length=3):
-        block_length = num_draft_tokens + 1
-        return {
-            "inputs_embeds": torch.randn(1, block_length, config.hidden_size),
-            "hidden_states": torch.randn(
-                1,
-                context_length,
-                config.hidden_size * len(config.dflash_config["target_layer_ids"]),
-            ),
-            "position_ids": torch.arange(context_length + block_length).reshape(1, -1),
-            "attention_mask": torch.ones(1, context_length + block_length),
-        }
+        return _per_row_inputs(config, context_length, num_draft_tokens + 1, committed_length=0)
 
     @staticmethod
     def _reference_convolution(hidden_states, dynamic_kernel, base_kernel, group_size):
@@ -362,35 +376,43 @@ class DFlash2ExportTest(unittest.TestCase):
     def test_grouped_dynamic_convolution_reference_parity(self):
         config = self._config()
         convolution = GroupedDynamicCausalConv(config).eval()
-        for sequence_length in (2, 4, 7):
-            with self.subTest(sequence_length=sequence_length):
-                hidden_states = torch.randn(2, sequence_length, config.hidden_size)
+        with torch.no_grad():
+            convolution.base_kernel.copy_(torch.randn_like(convolution.base_kernel))
+        context_length = 3
+        block = slice(context_length, None)
+        for block_length in (2, 4, 7):
+            with self.subTest(block_length=block_length):
+                # two sequences of rows [context ; block], flattened into one token axis by the convolution
+                num_rows = context_length + block_length
+                token_type_ids = torch.tensor([[0] * context_length + [1] * block_length] * 2)
+                block_tap_masks = _dflash_block_tap_masks(token_type_ids, convolution.kernel_size)
+                hidden_states = torch.randn(2, num_rows, config.hidden_size)
                 projected = convolution.kernel_projection(hidden_states).reshape(
                     2,
-                    sequence_length,
+                    num_rows,
                     2,
                     convolution.kernel_size,
                     convolution.num_groups,
                 )
-                prepared, output_kernel = convolution.prepare(hidden_states)
+                prepared, output_kernel = convolution.prepare(hidden_states, block_tap_masks)
                 reference_prepared = self._reference_convolution(
-                    hidden_states,
-                    projected[:, :, 0],
+                    hidden_states[:, block],
+                    projected[:, block, 0],
                     convolution.base_kernel[0],
                     convolution.group_size,
                 )
-                torch.testing.assert_close(prepared, reference_prepared)
-                torch.testing.assert_close(output_kernel, projected[:, :, 1])
+                torch.testing.assert_close(prepared[:, block], reference_prepared)
+                torch.testing.assert_close(output_kernel, projected[:, :, 1].reshape_as(output_kernel))
 
                 branch_output = torch.randn_like(hidden_states)
-                finished = convolution.finish(branch_output, output_kernel)
+                finished = convolution.finish(branch_output, output_kernel, block_tap_masks)
                 reference_finished = self._reference_convolution(
-                    branch_output,
-                    projected[:, :, 1],
+                    branch_output[:, block],
+                    projected[:, block, 1],
                     convolution.base_kernel[1],
                     convolution.group_size,
                 )
-                torch.testing.assert_close(finished, reference_finished)
+                torch.testing.assert_close(finished[:, block], reference_finished)
 
     def test_selector_lattice_and_path_reference_parity(self):
         config = self._config()
@@ -670,6 +692,7 @@ class DFlash2ExportTest(unittest.TestCase):
                     ("hidden_states", 3, ov.Type.f32),
                     ("position_ids", 2, ov.Type.i64),
                     ("attention_mask", 2, ov.Type.i64),
+                    ("token_type_ids", 2, ov.Type.i64),
                 ],
             )
             self.assertEqual(
@@ -710,6 +733,7 @@ class DFlash2ExportTest(unittest.TestCase):
                     "hidden_states": ov.Type.f32,
                     "position_ids": ov.Type.i64,
                     "attention_mask": ov.Type.i64,
+                    "token_type_ids": ov.Type.i64,
                 },
             )
             self.assertEqual(selector_ir.output("edge_scores").element_type, ov.Type.f32)
@@ -722,3 +746,212 @@ class DFlash2ExportTest(unittest.TestCase):
             self.assertEqual(codebook_types, [ov.Type.bf16, ov.Type.bf16])
             core.compile_model(draft_ir, "CPU")
             core.compile_model(selector_ir, "CPU")
+
+
+_SLIDING_WINDOW = 6
+# GenAI pages the KV cache in blocks of 32 tokens on CPU
+_CPU_KV_BLOCK_SIZE = 32
+# (context delta, block) rows per draft step: the first step spans two cache blocks, and every step
+# reaches past the sliding window
+_DRAFT_STEPS = ((34, 4), (3, 4), (1, 4), (2, 4))
+# PagedAttentionExtension input ports
+_PA_KEY_CACHE, _PA_SLIDING_WINDOW, _PA_TOKEN_TYPE_IDS = 3, 10, 25
+
+
+@unittest.skipUnless(is_transformers_version(">=", "4.57"), "DFlash-2 requires Transformers 4.57 or newer")
+class DFlashPerRowBackendTest(unittest.TestCase):
+    """One per-row draft IR serves both the stateful SDPA and the PagedAttention backends."""
+
+    VARIANTS = (("dflash",), ("dflash2",), ("dspark",))
+
+    @staticmethod
+    def _model(variant):
+        config = Qwen3Config.from_pretrained(MODEL_NAMES["qwen3"])
+        num_target_layers = config.num_hidden_layers
+        config.num_hidden_layers = 3
+        config.num_target_layers = num_target_layers
+        # grouped-query attention, as in the released drafts, so the converted graph covers the K/V head expansion
+        config.num_key_value_heads = 1
+        config.layer_types = ["sliding_attention", "full_attention", "sliding_attention"]
+        config.use_sliding_window = True
+        config.sliding_window = _SLIDING_WINDOW
+        config.is_causal = False
+        target_layer_ids = [0, num_target_layers - 1]
+        mask_token_id = config.vocab_size - 1
+        if variant == "dflash":
+            config.architectures = ["DFlashDraftModel"]
+            config.dflash_config = {"mask_token_id": mask_token_id, "target_layer_ids": target_layer_ids}
+            model_class = Qwen3DFlashForCausalLM
+        elif variant == "dflash2":
+            config.architectures = ["DFlash2DraftModel"]
+            config.dflash_config = {
+                "conv_group_size": 8 if config.hidden_size % 8 == 0 else 1,
+                "conv_kernel_size": 3,
+                "mask_token_id": mask_token_id,
+                "selector_rank": 8,
+                "selector_top_k": 4,
+                "target_layer_ids": target_layer_ids,
+            }
+            model_class = Qwen3DFlash2ForCausalLM
+        else:
+            config.architectures = ["Qwen3DSparkModel"]
+            config.markov_rank = 0
+            config.mask_token_id = mask_token_id
+            config.target_layer_ids = target_layer_ids
+            model_class = Qwen3DSparkForCausalLM
+        torch.manual_seed(0)
+        model = model_class(config).eval()
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                # the default base kernel only passes the current row, which would hide taps reaching other rows
+                if name.endswith("base_kernel"):
+                    parameter.copy_(torch.randn_like(parameter))
+        return model
+
+    @staticmethod
+    def _draft_steps(config):
+        torch.manual_seed(1)
+        steps, committed_length = [], 0
+        for context_length, block_length in _DRAFT_STEPS:
+            steps.append(_per_row_inputs(config, context_length, block_length, committed_length))
+            committed_length += context_length
+        return steps
+
+    @staticmethod
+    def _reference_outputs(model, steps):
+        cache = DynamicCache()
+        with torch.no_grad():
+            return [model(**inputs, past_key_values=cache, use_cache=True).last_hidden_state for inputs in steps]
+
+    @staticmethod
+    def _export_stateful_draft(model, output_dir):
+        _, parts, stateful = _get_submodels_and_export_configs(
+            model,
+            task="text-generation-with-past",
+            monolith=False,
+            custom_export_configs={},
+            custom_architecture=False,
+            _variant="default",
+            library_name="transformers",
+            stateful=True,
+        )
+        export_models(
+            parts,
+            output_dir,
+            output_names=[f"openvino_{name}.xml" for name in parts],
+            input_shapes={"batch_size": 1, "sequence_length": 3},
+            stateful=stateful,
+            library_name="transformers",
+        )
+        return output_dir / "openvino_model.xml"
+
+    @staticmethod
+    def _source_constant(output):
+        node = output.get_node()
+        while node.get_type_name() != "Constant":
+            node = node.input_value(0).get_node()
+        return node.get_data()
+
+    def _assert_paged_attention_conversion(self, model, config):
+        ops = Counter(op.get_type_name() for op in model.get_ops())
+        self.assertEqual(ops["ScaledDotProductAttention"], config.num_hidden_layers)
+        paged_attention_transformation(model)
+        ops = Counter(op.get_type_name() for op in model.get_ops())
+        self.assertEqual(ops["ScaledDotProductAttention"], 0)
+        self.assertEqual(ops["PagedAttentionExtension"], config.num_hidden_layers)
+        self.assertEqual(ops["ReadValue"] + ops["Assign"], 0)
+
+        token_type_ids = model.input("token_type_ids").get_node()
+        for op in model.get_ops():
+            if op.get_type_name() != "PagedAttentionExtension":
+                continue
+            layer_idx = int(op.input_value(_PA_KEY_CACHE).get_any_name().split(".")[-1])
+            with self.subTest(layer=layer_idx):
+                # the block attends bidirectionally only if token_type_ids reaches PagedAttention
+                token_type_source = op.input_value(_PA_TOKEN_TYPE_IDS).get_node()
+                if token_type_source.get_type_name() == "Convert":
+                    token_type_source = token_type_source.input_value(0).get_node()
+                self.assertIs(token_type_source, token_type_ids)
+                expected_window = _SLIDING_WINDOW if config.layer_types[layer_idx] == "sliding_attention" else 0
+                self.assertEqual(self._source_constant(op.input_value(_PA_SLIDING_WINDOW)).item(), expected_window)
+
+    @parameterized.expand(VARIANTS)
+    def test_per_row_draft_reads_each_input_only_in_its_rows(self, variant):
+        model = self._model(variant)
+        torch.manual_seed(2)
+        inputs = _per_row_inputs(model.config, context_length=5, block_length=4, committed_length=0)
+        is_block = inputs["token_type_ids"][..., None] == 1
+        ignored_rows_changed = dict(
+            inputs,
+            inputs_embeds=torch.where(is_block, inputs["inputs_embeds"], torch.randn_like(inputs["inputs_embeds"])),
+            hidden_states=torch.where(is_block, torch.randn_like(inputs["hidden_states"]), inputs["hidden_states"]),
+        )
+        context_changed = dict(
+            inputs,
+            hidden_states=torch.where(is_block, inputs["hidden_states"], torch.randn_like(inputs["hidden_states"])),
+        )
+        with torch.no_grad():
+            reference = model(**inputs, use_cache=False).last_hidden_state
+            ignored_output = model(**ignored_rows_changed, use_cache=False).last_hidden_state
+            context_output = model(**context_changed, use_cache=False).last_hidden_state
+        torch.testing.assert_close(ignored_output, reference)
+        self.assertFalse(torch.allclose(context_output, reference))
+
+    @parameterized.expand(VARIANTS)
+    def test_stateful_and_paged_backends_match_pytorch(self, variant):
+        model = self._model(variant)
+        config = model.config
+        steps = self._draft_steps(config)
+        references = self._reference_outputs(model, steps)
+        core = ov.Core()
+        f32 = {"INFERENCE_PRECISION_HINT": "f32"}
+        with TemporaryDirectory() as tmpdirname:
+            draft_path = self._export_stateful_draft(model, Path(tmpdirname))
+
+            with self.subTest(backend="stateful SDPA"):
+                request = core.compile_model(core.read_model(draft_path), "CPU", f32).create_infer_request()
+                for step, (inputs, reference) in enumerate(zip(steps, references)):
+                    feed = {name: value.numpy() for name, value in inputs.items()}
+                    feed["beam_idx"] = np.zeros(1, dtype=np.int32)
+                    output = torch.from_numpy(np.array(request.infer(feed)["last_hidden_state"]))
+                    torch.testing.assert_close(output, reference, rtol=1e-4, atol=1e-5, msg=f"step {step}")
+
+            with self.subTest(backend="PagedAttention"):
+                paged_model = core.read_model(draft_path)
+                self._assert_paged_attention_conversion(paged_model, config)
+                compiled = core.compile_model(paged_model, "CPU", {**f32, "KV_CACHE_PRECISION": "f32"})
+                request = compiled.create_infer_request()
+                max_length = sum(context for context, _ in _DRAFT_STEPS) + max(block for _, block in _DRAFT_STEPS)
+                num_blocks = math.ceil(max_length / _CPU_KV_BLOCK_SIZE)
+                cache_names = set()
+                for port in compiled.inputs:
+                    name = port.get_any_name()
+                    if name.startswith(("key_cache.", "value_cache.")):
+                        shape = [num_blocks] + [dim.get_length() for dim in list(port.get_partial_shape())[1:]]
+                        cache = ov.Tensor(port.get_element_type(), shape)
+                        cache.data[...] = 0
+                        request.set_tensor(name, cache)
+                        cache_names.add(name)
+
+                committed_length = 0
+                for step, ((context_length, block_length), inputs, reference) in enumerate(
+                    zip(_DRAFT_STEPS, steps, references)
+                ):
+                    # token-major rows; past_lens excludes the previous block, so this step overwrites it
+                    num_rows = context_length + block_length
+                    used_blocks = math.ceil((committed_length + num_rows) / _CPU_KV_BLOCK_SIZE)
+                    feed = {
+                        "inputs_embeds": inputs["inputs_embeds"].reshape(num_rows, -1).numpy(),
+                        "hidden_states": inputs["hidden_states"].reshape(num_rows, 1, -1).numpy(),
+                        "position_ids": inputs["position_ids"].reshape(num_rows).numpy(),
+                        "token_type_ids": inputs["token_type_ids"].reshape(num_rows, 1).numpy(),
+                        "past_lens": np.array([committed_length], dtype=np.int32),
+                        "subsequence_begins": np.array([0, num_rows], dtype=np.int32),
+                        "block_indices": np.arange(used_blocks, dtype=np.int32),
+                        "block_indices_begins": np.array([0, used_blocks], dtype=np.int32),
+                        "max_context_len": np.array(committed_length + num_rows, dtype=np.int32),
+                    }
+                    self.assertEqual({port.get_any_name() for port in compiled.inputs}, set(feed) | cache_names)
+                    output = torch.from_numpy(np.array(request.infer(feed)["last_hidden_state"]))
+                    torch.testing.assert_close(output, reference, rtol=1e-4, atol=1e-5, msg=f"step {step}")
+                    committed_length += context_length

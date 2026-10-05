@@ -9023,6 +9023,36 @@ def _dflash_attention_masks(
     return full_mask, torch.where(masked, min_value, window_mask)
 
 
+def _dflash_block_hidden_states(
+    last_hidden_state: torch.Tensor, token_type_ids: Optional[torch.Tensor], inputs_embeds: torch.Tensor
+) -> torch.Tensor:
+    """Hidden states of the trailing block rows as [batch, block, hidden].
+
+    Without token_type_ids, inputs_embeds holds only the block rows. With token_type_ids, the flattened
+    rows of a single sequence are sliced, which holds whether tokens lie along the sequence axis (stateful
+    SDPA) or along the batch axis (after SDPAToPagedAttention).
+    """
+    if token_type_ids is None:
+        return last_hidden_state[:, -inputs_embeds.shape[1] :, :]
+    rows = last_hidden_state.reshape(-1, last_hidden_state.shape[-1])
+    block_length = (token_type_ids == 1).sum()
+    return rows[rows.shape[0] - block_length :][None]
+
+
+def _dflash_block_tap_masks(token_type_ids: torch.Tensor, kernel_size: int) -> List[torch.Tensor]:
+    """Per-tap [rows, 1] masks over the flattened rows for block-local causal convolution.
+
+    Entry `tap` is True where a row and the `tap` rows before it all lie in one contiguous block run, so a tap
+    never reaches context rows or another block. Blocks of different sequences must be separated by context rows.
+    """
+    token_types = token_type_ids.reshape(-1, 1)
+    masks = [token_types == 1]
+    for tap in range(1, kernel_size):
+        shifted_types = F.pad(token_types, (0, 0, tap, 0))[:-tap]
+        masks.append(masks[-1] & (shifted_types == 1))
+    return masks
+
+
 def _dflash_past_key_value(past_key_values: Cache, layer_idx: int):
     """Cached (key, value) of a layer before it is updated, or (None, None) while the cache is empty."""
     layers = getattr(past_key_values, "layers", None)
@@ -9036,11 +9066,20 @@ def _dflash_past_key_value(past_key_values: Cache, layer_idx: int):
 
 
 def _dflash_set_past_key_value(past_key_values: Cache, layer_idx: int, key: torch.Tensor, value: torch.Tensor):
-    """Replace the cached (key, value) of a layer."""
+    """Replace the cached (key, value) of a layer.
+
+    Sliding-window layers also keep the whole committed context, because the window is applied by the mask;
+    their update() would truncate it and their length counter would go stale.
+    """
     layers = getattr(past_key_values, "layers", None)
     if layers is not None:
-        if layer_idx < len(layers) and getattr(layers[layer_idx], "is_initialized", True):
-            layers[layer_idx].keys, layers[layer_idx].values = key, value
+        if layer_idx < len(layers):
+            layer = layers[layer_idx]
+            if not getattr(layer, "is_initialized", True):
+                layer.lazy_initialization(key, value)
+            layer.keys, layer.values = key, value
+            if isinstance(getattr(layer, "cumulative_length", None), int):
+                layer.cumulative_length = key.shape[-2]
         else:
             past_key_values.update(key, value, layer_idx)
     elif layer_idx < len(past_key_values.key_cache):
@@ -9133,6 +9172,7 @@ class Qwen3DFlashDecoderLayer(nn.Module):
         past_key_value: Optional[Cache] = None,
         block_length: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        block_tap_masks: Optional[List[torch.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.FloatTensor:
         # Context rows always attend with the target features and block rows with their own normalized
@@ -9142,7 +9182,7 @@ class Qwen3DFlashDecoderLayer(nn.Module):
         block_states = self.input_layernorm(hidden_states)
         attention_kernel = None
         if self.attention_conv is not None:
-            block_states, attention_kernel = self.attention_conv.prepare(block_states)
+            block_states, attention_kernel = self.attention_conv.prepare(block_states, block_tap_masks)
         attention_input = torch.where(is_block, block_states, target_hidden)
         hidden_states = self.self_attn(
             hidden_states=attention_input,
@@ -9153,17 +9193,17 @@ class Qwen3DFlashDecoderLayer(nn.Module):
             **kwargs,
         )[0]
         if attention_kernel is not None:
-            hidden_states = self.attention_conv.finish(hidden_states, attention_kernel)
+            hidden_states = self.attention_conv.finish(hidden_states, attention_kernel, block_tap_masks)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         mlp_kernel = None
         if self.mlp_conv is not None:
-            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
+            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states, block_tap_masks)
         hidden_states = self.mlp(hidden_states)
         if mlp_kernel is not None:
-            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel, block_tap_masks)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -9200,6 +9240,9 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
 
     def _init_dflash_variant(self, config) -> None:
         pass
+
+    def _dflash_layer_inputs(self, token_type_ids: torch.LongTensor) -> Dict[str, Any]:
+        return {}
 
     def forward(
         self,
@@ -9260,6 +9303,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             attention_mask, token_type_ids, getattr(self.config, "sliding_window", None), noise_states.dtype
         )
         position_embeddings = self.rotary_emb(noise_states, position_ids)
+        layer_inputs = self._dflash_layer_inputs(token_type_ids)
         for layer in self.layers:
             noise_states = layer(
                 target_hidden=target_hidden,
@@ -9269,6 +9313,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 block_length=block_length,
                 position_embeddings=position_embeddings,
+                **layer_inputs,
                 **kwargs,
             )
         return BaseModelOutputWithPast(
@@ -9310,15 +9355,8 @@ class Qwen3DFlashForCausalLM(Qwen3DFlashDraftModel, GenerationMixin):
             **kwargs,
         )
         # Keep the block rows and drop the seed so emitted hidden states align 1:1 with the draft candidate
-        # tokens that the grafted lm_head will score. The block trails the rows of the sequence, so the
-        # flattened rows are sliced, which holds whether tokens lie along the sequence or the batch axis.
-        all_hidden_states = outputs.last_hidden_state
-        if token_type_ids is None:
-            block_hidden_states = all_hidden_states[:, -inputs_embeds.shape[1] :, :]
-        else:
-            rows = all_hidden_states.reshape(-1, all_hidden_states.shape[-1])
-            block_length = (token_type_ids == 1).sum()
-            block_hidden_states = rows[rows.shape[0] - block_length :][None]
+        # tokens that the grafted lm_head will score.
+        block_hidden_states = _dflash_block_hidden_states(outputs.last_hidden_state, token_type_ids, inputs_embeds)
         if logits_to_keep is None:
             last_hidden_state = block_hidden_states[:, 1:, :]
         else:
@@ -9330,7 +9368,11 @@ class Qwen3DFlashForCausalLM(Qwen3DFlashDraftModel, GenerationMixin):
 
 
 class GroupedDynamicCausalConv(nn.Module):
-    """Block-local grouped dynamic convolution used around each DFlash-2 sublayer."""
+    """Block-local grouped dynamic convolution used around each DFlash-2 sublayer.
+
+    Taps shift along the flattened rows rather than the sequence axis, because SDPAToPagedAttention moves the
+    tokens to the batch axis. block_tap_masks keep every tap inside the block of the row it produces.
+    """
 
     def __init__(self, config: "Qwen3Config"):
         super().__init__()
@@ -9356,44 +9398,37 @@ class GroupedDynamicCausalConv(nn.Module):
         hidden_states: torch.Tensor,
         dynamic_kernel: torch.Tensor,
         side: int,
+        block_tap_masks: List[torch.Tensor],
     ) -> torch.Tensor:
-        batch_size, sequence_length, _ = hidden_states.shape
+        rows = hidden_states.reshape(-1, self.hidden_size)
         base_kernel = self.base_kernel[side].reshape(
             self.kernel_size,
             self.num_groups,
             self.group_size,
         )
-        kernel = dynamic_kernel.unsqueeze(-1) + base_kernel[None, None, :, :, :]
+        kernel = dynamic_kernel.unsqueeze(-1) + base_kernel[None, :, :, :]
 
-        output = torch.zeros_like(hidden_states).reshape(
-            batch_size,
-            sequence_length,
-            self.num_groups,
-            self.group_size,
-        )
+        output = torch.zeros_like(rows).reshape(-1, self.num_groups, self.group_size)
         for tap in range(self.kernel_size):
-            shifted_states = F.pad(hidden_states, (0, 0, tap, 0))[:, :sequence_length, :].reshape(
-                batch_size,
-                sequence_length,
-                self.num_groups,
-                self.group_size,
-            )
-            output = output + shifted_states * kernel[:, :, tap, :, :]
-        return output.reshape(batch_size, sequence_length, self.hidden_size)
+            if tap == 0:
+                shifted_states = rows
+            else:
+                # select rather than multiply, so discarded context rows can never inject inf/nan
+                shifted_states = F.pad(rows, (0, 0, tap, 0))[:-tap].masked_fill(~block_tap_masks[tap], 0.0)
+            output = output + shifted_states.reshape(-1, self.num_groups, self.group_size) * kernel[:, tap, :, :]
+        return output.reshape(hidden_states.shape)
 
-    def prepare(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, sequence_length, _ = hidden_states.shape
-        dynamic_kernel = self.kernel_projection(hidden_states).reshape(
-            batch_size,
-            sequence_length,
-            2,
-            self.kernel_size,
-            self.num_groups,
-        )
-        return self._apply_kernel(hidden_states, dynamic_kernel[:, :, 0, :, :], 0), dynamic_kernel[:, :, 1, :, :]
+    def prepare(
+        self, hidden_states: torch.Tensor, block_tap_masks: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        dynamic_kernel = self.kernel_projection(hidden_states).reshape(-1, 2, self.kernel_size, self.num_groups)
+        prepared = self._apply_kernel(hidden_states, dynamic_kernel[:, 0, :, :], 0, block_tap_masks)
+        return prepared, dynamic_kernel[:, 1, :, :]
 
-    def finish(self, hidden_states: torch.Tensor, dynamic_kernel: torch.Tensor) -> torch.Tensor:
-        return self._apply_kernel(hidden_states, dynamic_kernel, 1)
+    def finish(
+        self, hidden_states: torch.Tensor, dynamic_kernel: torch.Tensor, block_tap_masks: List[torch.Tensor]
+    ) -> torch.Tensor:
+        return self._apply_kernel(hidden_states, dynamic_kernel, 1, block_tap_masks)
 
 
 class DFlash2CandidateSelector(nn.Module):
@@ -9460,6 +9495,10 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
     def _init_dflash_variant(self, config) -> None:
         self.candidate_selector = DFlash2CandidateSelector(config)
 
+    def _dflash_layer_inputs(self, token_type_ids: torch.LongTensor) -> Dict[str, Any]:
+        kernel_size = self.layers[0].attention_conv.kernel_size
+        return {"block_tap_masks": _dflash_block_tap_masks(token_type_ids, kernel_size)}
+
 
 class Qwen3DFlash2ForCausalLM(Qwen3DFlash2DraftModel, GenerationMixin):
     """DFlash-2 backbone exported without the shared target embedding, LM head, or selector."""
@@ -9473,6 +9512,7 @@ class Qwen3DFlash2ForCausalLM(Qwen3DFlash2DraftModel, GenerationMixin):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = None,
         logits_to_keep: Optional[int] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         outputs = super().forward(
@@ -9482,12 +9522,14 @@ class Qwen3DFlash2ForCausalLM(Qwen3DFlash2DraftModel, GenerationMixin):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            token_type_ids=token_type_ids,
             **kwargs,
         )
+        block_hidden_states = _dflash_block_hidden_states(outputs.last_hidden_state, token_type_ids, inputs_embeds)
         if logits_to_keep is None:
-            last_hidden_state = outputs.last_hidden_state[:, 1:, :]
+            last_hidden_state = block_hidden_states[:, 1:, :]
         else:
-            last_hidden_state = outputs.last_hidden_state[:, -logits_to_keep:, :]
+            last_hidden_state = block_hidden_states[:, -logits_to_keep:, :]
         return BaseModelOutputWithPast(
             last_hidden_state=last_hidden_state,
             past_key_values=outputs.past_key_values,
@@ -9546,6 +9588,7 @@ class Qwen3DSparkForCausalLM(Qwen3DFlashDraftModel, GenerationMixin):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = None,
         logits_to_keep: Optional[int] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         outputs = super().forward(
@@ -9555,12 +9598,14 @@ class Qwen3DSparkForCausalLM(Qwen3DFlashDraftModel, GenerationMixin):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            token_type_ids=token_type_ids,
             **kwargs,
         )
+        block_hidden_states = _dflash_block_hidden_states(outputs.last_hidden_state, token_type_ids, inputs_embeds)
         if logits_to_keep is None:
-            last_hidden_state = outputs.last_hidden_state
+            last_hidden_state = block_hidden_states
         else:
-            last_hidden_state = outputs.last_hidden_state[:, -logits_to_keep:, :]
+            last_hidden_state = block_hidden_states[:, -logits_to_keep:, :]
         return BaseModelOutputWithPast(
             last_hidden_state=last_hidden_state,
             past_key_values=outputs.past_key_values,
