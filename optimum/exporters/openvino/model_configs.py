@@ -38,12 +38,19 @@ from optimum.exporters.openvino.config import (
     TextSeq2SeqOpenVINOConfig,
     VisionOpenVINOConfig,
 )
-from optimum.exporters.openvino.dflash_utils import DFLASH_ARCHITECTURES, parse_and_validate_dflash_config
+from optimum.exporters.openvino.dflash_utils import (
+    DFLASH_ARCHITECTURES,
+    DSPARK_ARCHITECTURES,
+    parse_and_validate_dflash_config,
+    parse_and_validate_dspark_config,
+    validate_dspark_selector_top_k,
+)
 from optimum.exporters.openvino.input_generators import (
     AquilaDummyPastKeyValuesGenerator,
     ChatGLM2DummyPastKeyValuesGenerator,
     DeciDummyPastKeyValuesGenerator,
     DFlash2SelectorDummyGenerator,
+    DSparkMarkovDummyGenerator,
     DummyAudioPhi4MMInputGenerator,
     DummyDeepseekOCR2VisionInputGenerator,
     DummyDeepseekOCR2VisionTilesInputGenerator,
@@ -503,14 +510,9 @@ class Qwen3OpenVINOConfig(TextDecoderWithPositionIdsOpenVINOConfig):
         if self.dflash:
             dflash = parse_and_validate_dflash_config(config)
             self.dflash2 = dflash.version == 2
-        elif architecture == "Qwen3DSparkModel":
-            if getattr(config, "markov_rank", 0) != 0:
-                raise ValueError(
-                    "Exporting Qwen3DSparkModel is only supported for DFlash mode (markov_rank == 0). "
-                    "DSpark export is not supported yet (got markov_rank != 0)."
-                )
+        elif architecture in DSPARK_ARCHITECTURES:
             self.dflash = True
-            self.candidate_position_offset = 0
+            self.candidate_position_offset = parse_and_validate_dspark_config(config).candidate_position_offset
             dflash_config = getattr(config, "dflash_config", None) or config.to_dict()
             if not dflash_config.get("target_layer_ids", []):
                 raise ValueError("DFlash export requires non-empty target_layer_ids in dflash_config or config.")
@@ -619,6 +621,80 @@ class DFlash2SelectorOpenVINOConfig(OpenVINOConfig):
         return {
             "draft_logits": {0: "batch_size", 1: "draft_sequence_length"},
             "draft_hidden_states": {0: "batch_size", 1: "draft_sequence_length"},
+            "anchor_token_ids": {0: "batch_size"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "edge_scores": {0: "batch_size", 1: "draft_sequence_length"},
+            "candidate_ids": {0: "batch_size", 1: "draft_sequence_length"},
+        }
+
+
+class DSparkMarkovStepOpenVINOConfig(OpenVINOConfig):
+    """Dense DSpark Markov step: previous token ids in, full-vocabulary logit bias out."""
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (DSparkMarkovDummyGenerator,)
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        task: str = "feature-extraction",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+        preprocessors: list[Any] | None = None,
+    ):
+        super().__init__(
+            config=config,
+            task=task,
+            int_dtype=int_dtype,
+            float_dtype=float_dtype,
+            preprocessors=preprocessors,
+        )
+        if parse_and_validate_dspark_config(config).markov_rank == 0:
+            raise ValueError("The DSpark Markov step graph requires a draft with a Markov head (markov_rank > 0).")
+        self.dspark_markov_graph = "step"
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {"prev_token_ids": {0: "batch_size"}}
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {"markov_bias": {0: "batch_size"}}
+
+
+class DSparkMarkovSelectorOpenVINOConfig(OpenVINOConfig):
+    """Opt-in Top-K lattice over the DSpark Markov head, using the DFlash-2 selector contract."""
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (DSparkMarkovDummyGenerator,)
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        top_k: int,
+        task: str = "feature-extraction",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+        preprocessors: list[Any] | None = None,
+    ):
+        super().__init__(
+            config=config,
+            task=task,
+            int_dtype=int_dtype,
+            float_dtype=float_dtype,
+            preprocessors=preprocessors,
+        )
+        self.dspark_selector_top_k = validate_dspark_selector_top_k(config, top_k)
+        self.dspark_markov_graph = "selector"
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "draft_logits": {0: "batch_size", 1: "draft_sequence_length"},
             "anchor_token_ids": {0: "batch_size"},
         }
 

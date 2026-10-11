@@ -35,6 +35,7 @@ from utils_tests import (
     TEST_NAME_TO_MODEL_TYPE,
     check_compression_state_per_model,
     get_dflash2_model_path,
+    get_dspark_model_path,
     get_num_quantized_nodes,
     get_supported_model_for_library,
     is_model_type_transformers_compatible,
@@ -1084,6 +1085,47 @@ class OVCLIExportTestCase(unittest.TestCase):
             )
             self.assertFalse(selector_model.has_rt_info(["runtime_options", "ACTIVATIONS_SCALE_FACTOR"]))
             self.assertFalse(selector_model.has_rt_info(["runtime_options", "KV_CACHE_PRECISION"]))
+
+    def test_exporters_cli_dspark_markov_package(self):
+        import openvino as ov
+
+        model_path = get_dspark_model_path()
+        for top_k, weight_format in ((None, None), (4, "int8")):
+            with self.subTest(top_k=top_k, weight_format=weight_format), TemporaryDirectory() as tmpdir:
+                command = [
+                    "optimum-cli",
+                    "export",
+                    "openvino",
+                    "--model",
+                    model_path,
+                    "--task",
+                    "text-generation-with-past",
+                    "--trust-remote-code",
+                ]
+                if top_k is not None:
+                    command.extend(["--dspark-top-k", str(top_k)])
+                if weight_format is not None:
+                    command.extend(["--weight-format", weight_format])
+                subprocess.run([*command, tmpdir], check=True)
+
+                core = ov.Core()
+                draft_model = core.read_model(Path(tmpdir) / "openvino_model.xml")
+                markov_model = core.read_model(Path(tmpdir) / "openvino_markov_model.xml")
+                selector_path = Path(tmpdir) / "openvino_selector_model.xml"
+                self.assertEqual(draft_model.get_rt_info()["dspark"]["markov_rank"].value, "8")
+                self.assertEqual(
+                    markov_model.get_rt_info()["dspark_markov"]["interface"].value,
+                    "markov_step_v1",
+                )
+                self.assertFalse(markov_model.has_rt_info(["nncf"]))
+                self.assertEqual(selector_path.exists(), top_k is not None)
+                if top_k is not None:
+                    selector_model = core.read_model(selector_path)
+                    self.assertEqual(selector_model.get_rt_info()["dflash_selector"]["kind"].value, "dspark_markov")
+                    self.assertEqual(selector_model.get_rt_info()["dflash_selector"]["top_k"].value, str(top_k))
+                    self.assertFalse(selector_model.has_rt_info(["nncf"]))
+                if weight_format == "int8":
+                    self.assertTrue(draft_model.has_rt_info(["nncf"]))
 
     @unittest.skipUnless(is_transformers_version(">=", "4.57"), "DFlash-2 requires Transformers 4.57 or newer")
     def test_exporters_cli_dflash2_selector_preserves_checkpoint_precision(self):

@@ -294,6 +294,16 @@ def parse_args_openvino(parser: "ArgumentParser"):
         type=json.loads,
         help=("Any kwargs passed to the model forward, or used to customize the export for a given model."),
     )
+    optional_group.add_argument(
+        "--dspark-top-k",
+        type=int,
+        default=None,
+        help=(
+            "For DSpark draft models with a Markov head, also export openvino_selector_model.xml: an opt-in Top-K "
+            "lattice that restricts every draft position to the K best backbone candidates. The dense Markov step "
+            "model (openvino_markov_model.xml) is always exported."
+        ),
+    )
 
 
 def no_compression_parameter_provided(args):
@@ -494,6 +504,7 @@ class OVExportCommand(BaseOptimumCLICommand):
                 library_name=library_name,
                 variant=self.args.variant,
                 model_kwargs=self.args.model_kwargs,
+                dspark_top_k=self.args.dspark_top_k,
                 # **input_shapes,
             )
             if apply_main_quantize:

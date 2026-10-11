@@ -82,6 +82,52 @@ def get_dflash2_model_path():
     return str(output_dir)
 
 
+_DSPARK_MODEL_PATHS = {}
+
+
+def get_dspark_model_path(sample_from_anchor: bool = True):
+    """Create a tiny DeepSpec DSpark checkpoint with a vanilla Markov head, once per process."""
+    key = sample_from_anchor
+    if key in _DSPARK_MODEL_PATHS:
+        return _DSPARK_MODEL_PATHS[key]
+
+    from transformers import AutoConfig
+
+    from optimum.exporters.openvino.model_patcher import Qwen3DSparkForCausalLM
+
+    target_config = AutoConfig.from_pretrained("optimum-intel-internal-testing/tiny-random-qwen3")
+    target_num_hidden_layers = target_config.num_hidden_layers
+    config = deepcopy(target_config)
+    config.num_hidden_layers = min(2, target_num_hidden_layers)
+    config.num_target_layers = target_num_hidden_layers
+    if getattr(config, "layer_types", None):
+        config.layer_types = list(config.layer_types[: config.num_hidden_layers])
+    config.architectures = ["Qwen3DSparkModel"]
+    config.block_size = 4
+    config.mask_token_id = config.vocab_size - 1
+    config.target_layer_ids = [0, target_num_hidden_layers - 1]
+    config.markov_rank = 8
+    config.markov_head_type = "vanilla"
+    config.enable_confidence_head = False
+    config.sample_from_anchor = sample_from_anchor
+
+    output_dir = Path(tempfile.mkdtemp(prefix="optimum_intel_tiny_random_qwen3_dspark_"))
+    atexit.register(shutil.rmtree, output_dir, ignore_errors=True)
+    with torch.random.fork_rng():
+        torch.manual_seed(0)
+        model = Qwen3DSparkForCausalLM(config).eval()
+        # The default initializer makes the Markov bias negligible next to the draft logits,
+        # which would let tests pass without the head ever changing a sampled token.
+        torch.nn.init.normal_(model.markov_head.markov_w1.weight, std=1.0)
+        torch.nn.init.normal_(model.markov_head.markov_w2.weight, std=1.0)
+        model.save_pretrained(output_dir)
+    model.config.architectures = ["Qwen3DSparkModel"]
+    model.config.save_pretrained(output_dir)
+    _save_tiny_qwen3_tokenizer(output_dir)
+    _DSPARK_MODEL_PATHS[key] = str(output_dir)
+    return _DSPARK_MODEL_PATHS[key]
+
+
 @lru_cache(maxsize=1)
 def get_dflash2_target_model_path():
     """Create a matching Qwen3 target checkpoint, once per process, for DFlash-2 integration tests."""

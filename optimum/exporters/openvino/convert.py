@@ -33,7 +33,10 @@ from openvino.tools.ovc import convert_model
 from optimum.exporters.openvino.dflash_utils import (
     DFLASH2_GPU_MIN_ACTIVATIONS_SCALE_FACTOR,
     DFLASH_ARCHITECTURES,
+    DSPARK_ARCHITECTURES,
+    DSPARK_MARKOV_STEP_INTERFACE,
     parse_and_validate_dflash_config,
+    parse_and_validate_dspark_config,
 )
 from optimum.exporters.openvino.utils import (
     MULTI_MODAL_TEXT_GENERATION_MODELS,
@@ -156,6 +159,7 @@ def _save_model(
         model = _add_eagle3_mode_to_rt_info(model)
     is_dflash = getattr(config, "dflash", False)
     is_dflash_selector = getattr(config, "dflash2_selector", False)
+    dspark_markov_graph = getattr(config, "dspark_markov_graph", None)
     if is_dflash:
         model = _add_dflash_mode_to_rt_info(
             model,
@@ -164,10 +168,13 @@ def _save_model(
         )
     elif is_dflash_selector:
         model = _add_dflash_selector_mode_to_rt_info(model, config._config)
+    elif dspark_markov_graph is not None:
+        model = _add_dspark_markov_mode_to_rt_info(model, config)
     if (
         source_model is not None
         and not is_dflash
         and not is_dflash_selector
+        and dspark_markov_graph is None
         and getattr(getattr(source_model, "config", None), "model_type", None)
         in {
             "qwen3",
@@ -1080,6 +1087,13 @@ def _add_dflash_mode_to_rt_info(model: Model, hf_config: "PretrainedConfig", can
     except Exception:
         pass
 
+    if architecture in DSPARK_ARCHITECTURES:
+        dspark_config = parse_and_validate_dspark_config(hf_config)
+        if dspark_config.markov_rank > 0:
+            # Lets runtimes detect a DSpark draft that is loaded without its separately exported Markov graph.
+            model.set_rt_info(str(dspark_config.markov_rank), ["dspark", "markov_rank"])
+            model.set_rt_info(dspark_config.markov_head_type, ["dspark", "markov_head_type"])
+
     return model
 
 
@@ -1094,6 +1108,27 @@ def _add_dflash_selector_mode_to_rt_info(model: Model, hf_config: "PretrainedCon
     model.set_rt_info(str(hf_config.vocab_size), ["dflash_selector", "vocab_size"])
     model.set_rt_info(str(dflash_config["selector_top_k"]), ["dflash_selector", "top_k"])
 
+    return model
+
+
+def _add_dspark_markov_mode_to_rt_info(model: Model, config: "OpenVINOConfig") -> Model:
+    """Add the DSpark Markov-head contract: the dense step graph or the opt-in Top-K selector."""
+    hf_config = config._config
+    dspark_config = parse_and_validate_dspark_config(hf_config)
+    if config.dspark_markov_graph == "step":
+        model.set_rt_info("True", ["dspark_markov_mode"])
+        model.set_rt_info(DSPARK_MARKOV_STEP_INTERFACE, ["dspark_markov", "interface"])
+        model.set_rt_info(dspark_config.markov_head_type, ["dspark_markov", "head_type"])
+        model.set_rt_info(str(dspark_config.markov_rank), ["dspark_markov", "markov_rank"])
+        model.set_rt_info(str(hf_config.vocab_size), ["dspark_markov", "vocab_size"])
+    else:
+        model.set_rt_info("True", ["dflash_selector_mode"])
+        model.set_rt_info("dspark_markov", ["dflash_selector", "kind"])
+        model.set_rt_info(dspark_config.markov_head_type, ["dflash_selector", "markov_head_type"])
+        model.set_rt_info("unary_inclusive", ["dflash_selector", "score_semantics"])
+        model.set_rt_info("topk_lattice_v1", ["dflash_selector", "interface"])
+        model.set_rt_info(str(hf_config.vocab_size), ["dflash_selector", "vocab_size"])
+        model.set_rt_info(str(config.dspark_selector_top_k), ["dflash_selector", "top_k"])
     return model
 
 
@@ -1256,6 +1291,34 @@ def _get_submodels_and_export_configs(
         )
         models_for_export["selector_model"] = (selector_model, selector_config)
         stateful_per_model.append(False)
+    elif architecture in DSPARK_ARCHITECTURES and getattr(model, "markov_head", None) is not None:
+        from optimum.exporters.openvino.model_configs import (
+            DSparkMarkovSelectorOpenVINOConfig,
+            DSparkMarkovStepOpenVINOConfig,
+        )
+        from optimum.exporters.openvino.model_patcher import (
+            DSparkMarkovSelectorForExport,
+            DSparkMarkovStepForExport,
+        )
+
+        markov_config_kwargs = {
+            "task": "feature-extraction",
+            "int_dtype": int_dtype,
+            "float_dtype": float_dtype,
+            "preprocessors": preprocessors,
+        }
+        models_for_export["markov_model"] = (
+            DSparkMarkovStepForExport(model.markov_head, model.config),
+            DSparkMarkovStepOpenVINOConfig(model.config, **markov_config_kwargs),
+        )
+        stateful_per_model.append(False)
+        selector_top_k = getattr(model.config, "dspark_selector_top_k", None)
+        if selector_top_k is not None:
+            models_for_export["selector_model"] = (
+                DSparkMarkovSelectorForExport(model.markov_head, model.config, selector_top_k),
+                DSparkMarkovSelectorOpenVINOConfig(model.config, top_k=selector_top_k, **markov_config_kwargs),
+            )
+            stateful_per_model.append(False)
 
     # VLM Eagle3 models need stateful KV cache despite model_type being "llama"
     # (not in MULTI_MODAL_TEXT_GENERATION_MODELS) and task being "image-text-to-text".

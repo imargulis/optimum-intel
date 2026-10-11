@@ -29,7 +29,12 @@ from transformers.utils import is_torch_available
 
 from openvino import Core, Type, save_model
 from optimum.exporters.openvino.base import OpenVINOConfig
-from optimum.exporters.openvino.dflash_utils import DFLASH_ARCHITECTURES, parse_and_validate_dflash_config
+from optimum.exporters.openvino.dflash_utils import (
+    DFLASH_ARCHITECTURES,
+    DSPARK_ARCHITECTURES,
+    parse_and_validate_dflash_config,
+    validate_dspark_selector_top_k,
+)
 from optimum.exporters.tasks import TasksManager
 from optimum.intel.utils.import_utils import (
     DIFFUSERS_IMPORT_ERROR,
@@ -289,6 +294,7 @@ def main_export(
     library_name: Optional[str] = None,
     model_loading_kwargs: Optional[Dict[str, Any]] = None,
     variant: Optional[str] = None,
+    dspark_top_k: Optional[int] = None,
     **kwargs_shapes,
 ):
     """
@@ -344,6 +350,10 @@ def main_export(
             especially useful when exporting a custom architecture that needs to be splitted in multiple components (e.g. encoder-decoder). If unspecified with custom models, optimum will try to use the default submodels used for the given task, with no guarantee of success.
         stateful (`bool`, defaults to `True`):
             Produce stateful model where all kv-cache inputs and outputs are hidden in the model and are not exposed as model inputs and outputs. Applicable only for decoder models.
+        dspark_top_k (`Optional[int]`, defaults to `None`):
+            For DSpark drafts with a Markov head, also export `openvino_selector_model.xml`, an opt-in Top-K lattice
+            that restricts every draft position to the `dspark_top_k` best backbone candidates. The dense Markov step
+            model is always exported.
         **kwargs_shapes (`Dict`):
             Shapes to use during inference. This argument allows to override the default shapes used during the OpenVINO export.
 
@@ -393,6 +403,8 @@ def main_export(
     if isinstance(dtype, str):
         dtype = getattr(torch, dtype) if dtype != "auto" else dtype
 
+    if dspark_top_k is not None and library_name != "transformers":
+        raise ValueError("dspark_top_k is only supported for DSpark draft checkpoints.")
     if library_name == "transformers":
         config = AutoConfig.from_pretrained(
             model_name_or_path,
@@ -411,6 +423,10 @@ def main_export(
         archs = getattr(config, "architectures", None)
         if isinstance(archs, list) and archs and archs[0] in DFLASH_ARCHITECTURES:
             parse_and_validate_dflash_config(config)
+        if dspark_top_k is not None:
+            if not (isinstance(archs, list) and archs and archs[0] in DSPARK_ARCHITECTURES):
+                raise ValueError("dspark_top_k is only supported for DSpark draft checkpoints.")
+            config.dspark_selector_top_k = validate_dspark_selector_top_k(config, dspark_top_k)
         if isinstance(archs, list) and archs:
             draft_classes = _CUSTOM_DRAFT_MODEL_MAP.get(archs[0])
             if draft_classes is not None:
