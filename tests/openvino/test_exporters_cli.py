@@ -1127,6 +1127,29 @@ class OVCLIExportTestCase(unittest.TestCase):
                 if weight_format == "int8":
                     self.assertTrue(draft_model.has_rt_info(["nncf"]))
 
+    def test_exporters_cli_dspark_exports_tokenizer_only_when_shipped(self):
+        for with_tokenizer in (True, False):
+            model_path = get_dspark_model_path(with_tokenizer=with_tokenizer)
+            with self.subTest(with_tokenizer=with_tokenizer), TemporaryDirectory() as tmpdir:
+                subprocess.run(
+                    [
+                        "optimum-cli",
+                        "export",
+                        "openvino",
+                        "--model",
+                        model_path,
+                        "--task",
+                        "text-generation-with-past",
+                        "--trust-remote-code",
+                        tmpdir,
+                    ],
+                    check=True,
+                )
+                self.assertTrue((Path(tmpdir) / "openvino_markov_model.xml").exists())
+                self.assertEqual((Path(tmpdir) / "tokenizer.json").exists(), with_tokenizer)
+                if not with_tokenizer:
+                    self.assertEqual(sorted(path.name for path in Path(tmpdir).glob("*tokenizer*")), [])
+
     @unittest.skipUnless(is_transformers_version(">=", "4.57"), "DFlash-2 requires Transformers 4.57 or newer")
     def test_exporters_cli_dflash2_selector_preserves_checkpoint_precision(self):
         model_path = get_dflash2_model_path()

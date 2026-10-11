@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
-from transformers.utils import is_torch_available
+from transformers.utils import cached_file, is_torch_available
 
 from openvino import Core, Type, save_model
 from optimum.exporters.openvino.base import OpenVINOConfig
@@ -246,6 +246,34 @@ def update_config_for_custom_draft_model(config, auto_model, auto_model_for_caus
         }
     config.tie_word_embeddings = False
     return config
+
+
+_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model", "vocab.json")
+
+
+def _has_tokenizer_files(
+    model_name_or_path: str,
+    subfolder: str = "",
+    revision: Optional[str] = None,
+    cache_dir: str = HUGGINGFACE_HUB_CACHE,
+    token: Optional[Union[bool, str]] = None,
+    local_files_only: bool = False,
+) -> bool:
+    return any(
+        cached_file(
+            model_name_or_path,
+            filename,
+            subfolder=subfolder,
+            revision=revision,
+            cache_dir=cache_dir,
+            token=token,
+            local_files_only=local_files_only,
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+        )
+        is not None
+        for filename in _TOKENIZER_FILES
+    )
 
 
 def infer_library_name(
@@ -728,6 +756,15 @@ def main_export(
         preprocessors = load_preprocessors(
             model_name_or_path, subfolder=subfolder, trust_remote_code=trust_remote_code, model_type=model_type
         )
+        architectures = getattr(model.config, "architectures", None) or []
+        if (
+            architectures
+            and architectures[0] in DFLASH_ARCHITECTURES | DSPARK_ARCHITECTURES
+            and not _has_tokenizer_files(model_name_or_path, subfolder, revision, cache_dir, token, local_files_only)
+        ):
+            # Drafts run with the target model's tokenizer and are often published without one. Transformers 5
+            # then builds an empty default tokenizer from the config, which must not be exported with the draft.
+            preprocessors = [p for p in preprocessors if not isinstance(p, PreTrainedTokenizerBase)]
 
         submodel_paths = export_from_model(
             model=model,

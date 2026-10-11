@@ -85,9 +85,9 @@ def get_dflash2_model_path():
 _DSPARK_MODEL_PATHS = {}
 
 
-def get_dspark_model_path(sample_from_anchor: bool = True):
+def get_dspark_model_path(sample_from_anchor: bool = True, with_tokenizer: bool = True):
     """Create a tiny DeepSpec DSpark checkpoint with a vanilla Markov head, once per process."""
-    key = sample_from_anchor
+    key = (sample_from_anchor, with_tokenizer)
     if key in _DSPARK_MODEL_PATHS:
         return _DSPARK_MODEL_PATHS[key]
 
@@ -123,7 +123,8 @@ def get_dspark_model_path(sample_from_anchor: bool = True):
         model.save_pretrained(output_dir)
     model.config.architectures = ["Qwen3DSparkModel"]
     model.config.save_pretrained(output_dir)
-    _save_tiny_qwen3_tokenizer(output_dir)
+    if with_tokenizer:
+        _save_tiny_qwen3_tokenizer(output_dir)
     _DSPARK_MODEL_PATHS[key] = str(output_dir)
     return _DSPARK_MODEL_PATHS[key]
 
