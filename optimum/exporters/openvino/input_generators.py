@@ -17,7 +17,11 @@ from typing import Optional, Tuple
 
 import torch
 
-from optimum.exporters.openvino.dflash_utils import DFLASH_ARCHITECTURES, parse_and_validate_dflash_config
+from optimum.exporters.openvino.dflash_utils import (
+    DFLASH_ARCHITECTURES,
+    config_architecture,
+    parse_and_validate_dflash_config,
+)
 from optimum.exporters.openvino.utils import is_ltx2_3_transformer_config
 from optimum.intel.utils.import_utils import is_diffusers_version
 from optimum.utils import (
@@ -248,9 +252,7 @@ class Eagle3DummyGenerator(DummyInputGenerator):
         self.sequence_length = sequence_length
         self.hidden_size = normalized_config.hidden_size
         self.vocab_size = getattr(normalized_config, "vocab_size", None)
-        architectures = getattr(normalized_config.config, "architectures", None)
-        architecture = architectures[0] if isinstance(architectures, list) and architectures else None
-        if architecture in DFLASH_ARCHITECTURES:
+        if config_architecture(normalized_config.config) in DFLASH_ARCHITECTURES:
             dflash_config = parse_and_validate_dflash_config(normalized_config.config).values
         else:
             dflash_config = (
